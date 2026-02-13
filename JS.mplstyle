@@ -1,0 +1,42 @@
+figure.dpi: 150
+figure.facecolor: white
+figure.autolayout: True
+
+font.family: Arial
+axes.facecolor: white
+axes.titlesize: 15
+axes.labelsize: 10
+axes.linewidth: 1
+axes.titlepad: 5
+axes.spines.top: False
+axes.spines.right: False
+axes.spines.bottom: True
+axes.spines.left: True
+axes.formatter.useoffset: False
+axes.prop_cycle: cycler('color', ['4878d0', 'ee854a', '6acc64', 'd65f5f', '956cb4', '8c613c', 'dc7ec0', '797979', 'd5bb67', '82c6e2'])
+
+xtick.direction: in
+xtick.major.size: 4
+xtick.major.width: 1
+xtick.major.pad: 5
+xtick.minor.visible: False
+xtick.minor.size: 2
+xtick.minor.width: 1
+
+ytick.direction: in
+ytick.major.size: 4
+ytick.major.width: 1
+ytick.major.pad: 5
+ytick.minor.visible: False
+ytick.minor.size: 2
+ytick.minor.width: 1
+
+legend.fontsize: 7
+legend.frameon: False
+
+savefig.transparent: True
+savefig.dpi: 300
+
+image.interpolation: None
+
+svg.fonttype: none

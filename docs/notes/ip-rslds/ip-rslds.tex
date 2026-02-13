@@ -1,0 +1,47 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb}
+\usepackage[margin=1in]{geometry}
+
+\title{Inferred Population-Recurrent Switching Linear Dynamical System}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Idea}
+In modeling the activity of multiple neural populations, it is often assumed that the best way to group neurons is by their anatomical location. In the context of state space models, this means that we assume that neurons in the same anatomical region are best explained by the same set of latent variables.
+
+The idea with my model is to break that assumption and instead infer the best way to group neurons irrespective of anatomical boundaries. The thrust is that we should group neurons if their activity is explained by the same latent variable, not by their anatomy.
+
+\section{Model Outline}
+We have \(N\) neurons recorded over \(T\) time bins, with observations \(y_{it}\). The goal is to discover \(K\) functional populations, not assumed from anatomy but learned from the data.
+
+\subsection{Population Assignments}
+\begin{equation}
+z_i \sim \text{Multinomial}(\boldsymbol{\pi}), \quad i = 1, \dots, N
+\end{equation}
+
+\subsection{Discrete Dynamical States}
+A single global discrete state \(s_t \in \{1, \dots, M\}\) governs which dynamical regime is active at time \(t\). The transition depends on the previous state as well as the continuous latents (recurrence):
+\begin{equation}
+p(s_t = m \mid s_{t - 1}, \boldsymbol{x}_{t-1}) = \text{softmax} \bigg(\boldsymbol{R}^{s_{t-1}}\boldsymbol{\bar{x}}_{t-1} + r^{s_{t-1}}\bigg)_m
+\end{equation}
+We'll use whatever tricks they use in the Linderman papers for this.
+
+\subsection{Continuous Latent Dynamics}
+Each population \(k\) has its own latent trajectory \(\boldsymbol{x}_t^k \in \mathbb{R}^D\). The dynamics are linear-Gaussian but coupled across populations and modulated by the discrete state.
+\begin{equation}
+    \boldsymbol{x}_t^k = \underbrace{\boldsymbol{A}_{kk}^{s_t}\boldsymbol{x}_{t-1}^k}_{\text{within-population}} + \sum_{j\neq k}\boldsymbol{A}_{kj}^{s_t}\boldsymbol{x}_{t-1}^j + \boldsymbol{b}_k^{s_t} + \boldsymbol{\epsilon}_t^k
+\end{equation}
+where \(\boldsymbol{\epsilon}\sim \boldsymbol{\mathcal{N}}(\boldsymbol{0}, \boldsymbol{Q}_k^{s_t})\)
+
+The between-population terms \(\boldsymbol{A}_{kj}^{s_t}\) captures how population \(j\) influences population \(k\) and this influence can change depending on the discrete state.
+
+\subsection{Observations}
+Each neuron's activity is driven by the latent of its assigned population:
+\begin{equation}
+    y_{it} \mid z_i = k, \quad \boldsymbol{x}_t^k \sim \text{Poisson}\bigg( \exp\big(\boldsymbol{c}_i^\top \boldsymbol{x}_t^k + d_i\big)\bigg)
+\end{equation}
+
+\end{document}
