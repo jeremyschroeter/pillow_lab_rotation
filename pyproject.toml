@@ -7,6 +7,7 @@ dependencies = [
     "scipy",
     "matplotlib",
     "pandas",
+    "cvxpy"
 ]
 
 [project.optional-dependencies]

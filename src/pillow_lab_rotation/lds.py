@@ -42,7 +42,6 @@ class LinearDynamicalSystem:
             self.e_step()
             self.m_step()
             LL_new = self.log_likelihood()
-            print(f'{LL_new:0.5f}')
             if LL_new < LL_old:
                 raise ValueError('New LL less than old LL, implementation error')
             if LL_new - LL_old < 1e-5:
