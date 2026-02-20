@@ -1,6 +1,5 @@
 import numpy as np
-from pillow_lab_rotation.dists import MultivariateNormal
-inv = np.linalg.inv
+from numpy.linalg import inv, slogdet
 
 
 class LinearDynamicalSystem:
@@ -40,17 +39,18 @@ class LinearDynamicalSystem:
         LL_old = -np.inf
         while True:
             self.e_step()
-            self.m_step()
-            LL_new = self.log_likelihood()
+            LL_new = self.LL
             if LL_new < LL_old:
                 raise ValueError('New LL less than old LL, implementation error')
             if LL_new - LL_old < 1e-5:
                 break
             LL_old = LL_new
+            self.m_step()
 
     def e_step(self):
         self.run_filter()
         self.run_smoother()
+        self._get_sufficient_stats()
     
     def m_step(self):
         self.update_μ_and_V()
@@ -60,189 +60,166 @@ class LinearDynamicalSystem:
         self.update_R()
     
     def run_filter(self):
-        
-        self.z_filtered = np.zeros(shape=(self.n_trials, self.T, self.zdim, 1))
-        self.P_filtered = np.zeros(shape=(self.n_trials, self.T, self.zdim, self.zdim))
-        self.z_predicted = np.zeros(shape=(self.n_trials, self.T, self.zdim, 1))
-        self.P_predicted = np.zeros(shape=(self.n_trials, self.T, self.zdim, self.zdim))
 
-        for trial in range(self.n_trials):
-            Pt = self.V0
-            zt = self.μ0
-            for t in range(self.T):
-                
-                # Predict
-                if t == 0:
-                    z_pred = zt
-                    P_pred = Pt
-                else:
-                    z_pred = self.A @ zt
-                    P_pred = self.A @ Pt @ self.A.T + self.Γ
+        # Covariance pass
+        K_all = np.zeros((self.T, self.zdim, self.xdim))
+        P_pred_all = np.zeros((self.T, self.zdim, self.zdim))
+        P_filt_all = np.zeros((self.T, self.zdim, self.zdim))
+        P_obs_inv_all = np.zeros((self.T, self.xdim, self.xdim))
+        log_det_all = np.zeros(self.T)
 
-                x_pred = self.C @ z_pred
+        Pt = self.V0
+        for t in range(self.T):
+            P_pred = Pt if t == 0 else self.A @ Pt @ self.A.T + self.Γ
+            P_pred_all[t] = P_pred
+            P_obs = self.C @ P_pred @ self.C.T + self.R
+            P_obs_inv = inv(P_obs)
+            P_obs_inv_all[t] = P_obs_inv
+            _, log_det_all[t] = slogdet(P_obs)
+            K = P_pred @ self.C.T @ P_obs_inv
+            K_all[t] = K
+            Pt = P_pred - K @ self.C @ P_pred
+            P_filt_all[t] = Pt
 
-                # Store prediction
-                self.z_predicted[trial, t] = z_pred.copy()
-                self.P_predicted[trial, t] = P_pred.copy()
+        # Mean pass (vectorized across trials, computes log-likelihood)
+        z_filt = np.zeros((self.n_trials, self.T, self.zdim, 1))
+        z_pred = np.zeros((self.n_trials, self.T, self.zdim, 1))
+        LL = 0.0
 
-                # Update
-                xt = self.X[trial, t]
-                K = P_pred @ self.C.T @inv(self.C @ P_pred @ self.C.T + self.R)
-                z_filt = z_pred + K @ (xt - x_pred)
-                P_filt = P_pred - K @ self.C @ P_pred
+        zt = np.broadcast_to(self.μ0, (self.n_trials, self.zdim, 1)).copy()
+        for t in range(self.T):
+            zp = zt if t == 0 else (self.A @ zt)
+            z_pred[:, t] = zp
+            innov = self.X[:, t] - self.C @ zp
+            quad = (innov[:, :, 0] @ P_obs_inv_all[t] * innov[:, :, 0]).sum()
+            LL += -0.5 * (self.n_trials * (self.xdim * np.log(2 * np.pi) + log_det_all[t]) + quad)
+            zt = zp + K_all[t] @ innov
+            z_filt[:, t] = zt
 
-                # Store filtered updates
-                self.z_filtered[trial, t] = z_filt
-                self.P_filtered[trial, t] = P_filt
-                zt = z_filt
-                Pt = P_filt
+        self.P_predicted = np.broadcast_to(P_pred_all, (self.n_trials, self.T, self.zdim, self.zdim)).copy()
+        self.P_filtered = np.broadcast_to(P_filt_all, (self.n_trials, self.T, self.zdim, self.zdim)).copy()
+        self.z_filtered = z_filt
+        self.z_predicted = z_pred
+        self.LL = LL / (self.n_trials * self.T)
+
+
     
 
     def run_smoother(self):
 
-        self.Ez = np.zeros(shape=(self.n_trials, self.T, self.zdim, 1))
-        self.EzzT = np.zeros(shape=(self.n_trials, self.T, self.zdim, self.zdim))
-        self.Ezzm1T = np.zeros(shape=(self.n_trials, self.T, self.zdim, self.zdim))
+        # Covariance pass (same for all trials)
+        J_all = np.zeros((self.T - 1, self.zdim, self.zdim))
+        P_smooth_all = np.zeros((self.T, self.zdim, self.zdim))
+        sigma_x_all = np.zeros((self.T, self.zdim, self.zdim))
 
-        for trial in range(self.n_trials):
-            z_smooth_prev = self.z_filtered[trial, -1]
-            P_smooth_prev = self.P_filtered[trial, -1]
-            self.Ez[trial, -1] = z_smooth_prev
-            self.EzzT[trial, -1] = P_smooth_prev + z_smooth_prev @ z_smooth_prev.T
+        P_smooth_all[-1] = self.P_filtered[0, -1]
 
-            for t in range(self.T - 2, -1, -1):
-                z_from_filt = self.z_filtered[trial, t]
-                P_from_filt = self.P_filtered[trial, t]
-                z_from_pred = self.z_predicted[trial, t+1]
-                P_from_pred = self.P_predicted[trial, t+1]
+        for t in range(self.T - 2, -1, -1):
+            P_filt_t = self.P_filtered[0, t]
+            P_pred_tp1 = self.P_predicted[0, t + 1]
 
-                J = P_from_filt @ self.A.T @ inv(P_from_pred)
-                z_smooth = z_from_filt + J @ (z_smooth_prev - z_from_pred)
-                P_smooth = P_from_filt + J @ (P_smooth_prev - P_from_pred) @ J.T
+            J = P_filt_t @ self.A.T @ inv(P_pred_tp1)
+            J_all[t] = J
+            P_smooth_all[t] = P_filt_t + J @ (P_smooth_all[t + 1] - P_pred_tp1) @ J.T
+            sigma_x_all[t + 1] = J @ P_smooth_all[t + 1]
 
-                self.Ez[trial, t] = z_smooth
-                self.EzzT[trial, t] = P_smooth + z_smooth @ z_smooth.T
-                self.Ezzm1T[trial, t+1] = P_smooth_prev @ J.T + z_smooth_prev @ z_smooth.T
+        # Mean pass (vectorized across trials)
+        m = np.zeros((self.n_trials, self.T, self.zdim, 1))
+        m[:, -1] = self.z_filtered[:, -1]
 
-                z_smooth_prev = z_smooth
-                P_smooth_prev = P_smooth
+        for t in range(self.T - 2, -1, -1):
+            m[:, t] = self.z_filtered[:, t] + J_all[t] @ (m[:, t + 1] - self.z_predicted[:, t + 1])
+
+        self.m = m
+        self.sigma = np.broadcast_to(P_smooth_all, (self.n_trials, self.T, self.zdim, self.zdim)).copy()
+        self.sigma_x = np.broadcast_to(sigma_x_all, (self.n_trials, self.T, self.zdim, self.zdim)).copy()
+
+    def _get_sufficient_stats(self):
+        m = self.m[..., 0] # (n_trials, T, zdim)
+        x = self.X[..., 0] # (n_trials, T, xdim)
+
+        def _second_moment(m_slice, sigma_slice):
+            flat = m_slice.reshape(-1, self.zdim)
+            return flat.T @ flat + sigma_slice.reshape(-1, self.zdim, self.zdim).sum(0)
+        
+        def _cross_moment(a, b):
+            return a.reshape(-1, a.shape[-1]).T @ b.reshape(-1, b.shape[-1])
+
+        self.M11 = _second_moment(m[:, :1], self.sigma[:, :1])
+        self.M2T = _second_moment(m[:, 1:], self.sigma[:, 1:])
+        self.M1Tm1 = _second_moment(m[:, :-1], self.sigma[:, :-1])
+        self.M1T = self.M11 + self.M2T
+
+        self.M_delta = _cross_moment(m[:, :-1], m[:, 1:]) + self.sigma_x[:, 1:].reshape(-1, self.zdim, self.zdim).sum(0)
+
+        self.XXT = _cross_moment(x, x)
+        self.XXT_hat = _cross_moment(m, x)
+
 
 
     def update_μ_and_V(self):
-        self.μ0 = self.Ez[:, 0].mean(0)
-        self.V0 = self.EzzT[:, 0].mean(0) - self.μ0 @ self.μ0.T
-
+        self.μ0 = self.m[:, 0, :, 0].mean(0, keepdims=True).T
+        self.V0 = self.M11 / self.n_trials
+        
     def update_Γ(self):
-        Γ_new = np.zeros((self.zdim, self.zdim))
-        for trial in range(self.n_trials):
-            for t in range(1, self.T):
-                Γ_first = self.EzzT[trial, t]
-                Γ_second = self.Ezzm1T[trial, t] @ self.A.T
-                Γ_third = self.A @ self.Ezzm1T[trial, t].T
-                Γ_fourth = self.A @ self.EzzT[trial, t - 1] @ self.A.T
-                Γ_new += Γ_first - Γ_second - Γ_third + Γ_fourth
-        Γ_new /= (self.n_trials * (self.T - 1))
-        self.Γ = Γ_new
-    
-    def update_A(self):
-        A_new = np.zeros((2, self.zdim, self.zdim))
-        for trial in range(self.n_trials):
-            for t in range(1, self.T):
-                A_new[0] += self.Ezzm1T[trial, t]
-                A_new[1] += self.EzzT[trial, t - 1]
-        self.A = A_new[0] @ inv(A_new[1])
+        self.Γ = (1 / (self.n_trials*(self.T - 1))) * (self.M2T - self.A @ self.M_delta - self.M_delta.T @ self.A.T + self.A @ self.M1Tm1 @ self.A.T)
+        
 
+    def update_A(self):
+        self.A = self.M_delta.T @ inv(self.M1Tm1)
 
     def update_R(self):
-        R_new = np.zeros((self.xdim, self.xdim))
-        for trial in range(self.n_trials):
-            for t in range(self.T):
-                xt = self.X[trial, t]
-                zt = self.Ez[trial, t]
-                R_first = xt @ xt.T
-                R_second = xt @ zt.T @ self.C.T
-                R_third = self.C @ zt @ xt.T
-                R_fourth = self.C @ self.EzzT[trial, t] @ self.C.T
-                R_new +=  R_first - R_second - R_third + R_fourth
-        R_new /= (self.n_trials * self.T)
-        self.R = R_new
+        self.R = (1 / (self.T*self.n_trials)) * (self.XXT - self.C@self.XXT_hat - self.XXT_hat.T @ self.C.T + self.C @ self.M1T @ self.C.T)
     
     def update_C(self):
-        C_new = np.zeros((2, self.xdim, self.zdim))
-        for trial in range(self.n_trials):
-            for t in range(self.T):
-                C_new[0] += self.X[trial, t] @ self.Ez[trial, t].T
-                C_new[1] += self.EzzT[trial, t]
-        self.C = C_new[0] @ inv(C_new[1])
+        self.C = self.XXT_hat.T @ inv(self.M1T)
+       
 
-    def log_likelihood(self):
-        LL = 0
-        for trial in range(self.n_trials):
-            Pt = self.V0
-            zt = self.μ0
-            for t in range(self.T):
-    
-                # Predict
-                if t == 0:
-                    z_pred = zt
-                    P_pred = Pt
-                else:
-                    z_pred = self.A @ zt
-                    P_pred = self.A @ Pt @ self.A.T + self.Γ
-
-                x_pred = self.C @ z_pred
-                P_obs = self.C @ P_pred @ self.C.T + self.R
-                xt = self.X[trial, t]
-
-                LL += MultivariateNormal(x_pred.squeeze(), P_obs).log_pdf(xt.squeeze())
-
-                K = P_pred @ self.C.T @ inv(P_obs)
-                zt = z_pred + K @ (xt - x_pred)
-                Pt = P_pred - K @ self.C @ P_pred
-        
-        return LL / (self.n_trials * self.T)
-    
     def predict(self, X: np.ndarray):
-        
+
         trials, timesteps, _, _ = X.shape
 
-        LL = 0
-        pred_means = np.zeros(shape=(trials, timesteps, self.zdim, 1))
-        pred_covs = np.zeros(shape=(trials, timesteps, self.zdim, self.zdim))
-        obs_mean = np.zeros(shape=(trials, timesteps, self.xdim, 1))
-        obs_cov = np.zeros(shape=(trials, timesteps, self.xdim, self.xdim))
-        post_means = np.zeros(shape=(trials, timesteps, self.zdim, 1))
-        post_covs = np.zeros(shape=(trials, timesteps, self.zdim, self.zdim))
+        # Covariance pass
+        K_all = np.zeros((timesteps, self.zdim, self.xdim))
+        P_pred_all = np.zeros((timesteps, self.zdim, self.zdim))
+        P_filt_all = np.zeros((timesteps, self.zdim, self.zdim))
+        P_obs_all = np.zeros((timesteps, self.xdim, self.xdim))
+        P_obs_inv_all = np.zeros((timesteps, self.xdim, self.xdim))
+        log_det_all = np.zeros(timesteps)
 
-        for trial in range(trials):
-            Pt = self.V0
-            zt = self.μ0
-            for t in range(timesteps):
-                if t == 0:
-                    z_pred = zt
-                    P_pred = Pt
-                else:
-                    z_pred = self.A @ zt
-                    P_pred = self.A @ Pt @ self.A.T + self.Γ
-                
-                pred_means[trial, t] = z_pred
-                pred_covs[trial, t] = P_pred
-                
-                x_pred = self.C @ z_pred
-                P_obs = self.C @ P_pred @ self.C.T + self.R
+        Pt = self.V0
+        for t in range(timesteps):
+            P_pred = Pt if t == 0 else self.A @ Pt @ self.A.T + self.Γ
+            P_pred_all[t] = P_pred
+            P_obs = self.C @ P_pred @ self.C.T + self.R
+            P_obs_all[t] = P_obs
+            P_obs_inv = inv(P_obs)
+            P_obs_inv_all[t] = P_obs_inv
+            _, log_det_all[t] = slogdet(P_obs)
+            K = P_pred @ self.C.T @ P_obs_inv
+            K_all[t] = K
+            Pt = P_pred - K @ self.C @ P_pred
+            P_filt_all[t] = Pt
 
-                obs_mean[trial, t] = x_pred
-                obs_cov[trial, t] = P_obs
+        # Mean pass (vectorized across trials, computes log-likelihood)
+        z_pred = np.zeros((trials, timesteps, self.zdim, 1))
+        z_filt = np.zeros((trials, timesteps, self.zdim, 1))
+        LL = 0.0
 
-                xt = X[trial, t]
-                LL += MultivariateNormal(x_pred.squeeze(), P_obs).log_pdf(xt.squeeze())
-                
-                K = P_pred @ self.C.T @ inv(P_obs)
-                zt = z_pred + K @ (xt - x_pred)
-                Pt = P_pred - K @ self.C @ P_pred
+        zt = np.broadcast_to(self.μ0, (trials, self.zdim, 1)).copy()
+        for t in range(timesteps):
+            zp = zt if t == 0 else (self.A @ zt)
+            z_pred[:, t] = zp
+            innov = X[:, t] - self.C @ zp
+            quad = (innov[:, :, 0] @ P_obs_inv_all[t] * innov[:, :, 0]).sum()
+            LL += -0.5 * (trials * (self.xdim * np.log(2 * np.pi) + log_det_all[t]) + quad)
+            zt = zp + K_all[t] @ innov
+            z_filt[:, t] = zt
 
-                post_means[trial, t] = zt
-                post_covs[trial, t] = Pt
-        
-        return pred_means, pred_covs, obs_mean, obs_cov, post_means, post_covs
+        obs_mean = self.C @ z_pred
+        pred_covs = np.broadcast_to(P_pred_all, (trials, timesteps, self.zdim, self.zdim)).copy()
+        obs_cov = np.broadcast_to(P_obs_all, (trials, timesteps, self.xdim, self.xdim)).copy()
+        post_covs = np.broadcast_to(P_filt_all, (trials, timesteps, self.zdim, self.zdim)).copy()
+
+        return z_pred, pred_covs, obs_mean, obs_cov, z_filt, post_covs, LL
 
