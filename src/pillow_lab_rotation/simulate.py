@@ -1,72 +1,171 @@
 import numpy as np
+from pillow_lab_rotation.lds import LinearDynamicalSystem
 
 
-def simulate_ctds_data(
-    A, C, Q, R, mu0, V0,
-    n_trials: int,
-    T: int,
-    seed: int = 0
-):
-    """
-    Simulate data from a CTDS generative model.
+class LDSSim:
+    def __init__(
+            self,
+            xdim: int,
+            ydim: int
+    ):
+        self.xdim = xdim
+        self.ydim = ydim
 
-    Returns:
-        Y: (n_trials, T, N, 1) observed data
-        X: (n_trials, T, D, 1) latent states
-    """
-    rng = np.random.default_rng(seed)
-    D = A.shape[0]
-    N = C.shape[0]
+    def create_A_matrix(self):
+        A = np.random.standard_normal((self.xdim, self.xdim))
+        A /= (np.max(np.abs(np.linalg.eigvals(A))) + 0.5)
+        self.A = A
 
-    X = np.zeros((n_trials, T, D, 1))
-    Y = np.zeros((n_trials, T, N, 1))
+    def create_C_matrix(self):
+        self.C = np.random.standard_normal((self.ydim, self.xdim))
 
-    for n in range(n_trials):
-        x = rng.multivariate_normal(mu0.ravel(), V0)[:, None]
-        for t in range(T):
-            if t > 0:
-                x = A @ x + rng.multivariate_normal(np.zeros(D), Q)[:, None]
-            X[n, t] = x
-            Y[n, t] = C @ x + rng.multivariate_normal(np.zeros(N), R)[:, None]
+    def create_Q_matrix(self):
+        L = np.random.standard_normal((self.xdim, self.xdim))
+        self.Q = L @ L.T
 
-    return Y, X
+    def create_Q0_matrix(self):
+        L = np.random.standard_normal((self.xdim, self.xdim))
+        self.Q0 = L @ L.T
+
+    def create_mu0(self):
+        self.mu0 = np.random.standard_normal((self.xdim, 1))
+
+    def create_R_matrix(self):
+        self.R = np.diag(np.random.uniform(0.5, 2.0, self.ydim))
+
+    def get_A(self):
+        return self.A
+
+    def get_C(self):
+        return self.C
+
+    def get_Q(self):
+        return self.Q
+
+    def get_Q0(self):
+        return self.Q0
+
+    def get_mu0(self):
+        return self.mu0
+
+    def get_R(self):
+        return self.R
+
+    def get_params(self):
+        return self.A, self.C, self.Q, self.Q0, self.mu0, self.R
+
+    def create_params(self):
+        self.create_A_matrix()
+        self.create_C_matrix()
+        self.create_Q_matrix()
+        self.create_Q0_matrix()
+        self.create_mu0()
+        self.create_R_matrix()
+
+    def simulate(self, T: int, n_trials: int = 1):
+        lds = LinearDynamicalSystem(self.xdim, self.ydim)
+        lds.A = self.A
+        lds.C = self.C
+        lds.Q = self.Q
+        lds.Q0 = self.Q0
+        lds.mu0 = self.mu0
+        lds.R = self.R
+
+        x, y = lds.sample(T, n_trials)
+        return x, y
 
 
-def make_ctds_params(De, Di, Ne, Ni, seed=42):
-    """
-    Generate ground-truth CTDS parameters obeying Dale's law.
 
-    Returns dict with A, C, Q, R, mu0, V0.
-    """
-    rng = np.random.default_rng(seed)
-    D = De + Di
-    N = Ne + Ni
 
-    # Dynamics matrix obeying Dale's law
-    A = np.zeros((D, D))
-    # E columns: non-negative off-diagonal
-    A[:, :De] = rng.uniform(0, 0.3, (D, De))
-    # I columns: non-positive off-diagonal
-    A[:, De:] = -rng.uniform(0, 0.3, (D, Di))
-    # Diagonal: positive for stability (auto-correlation)
-    np.fill_diagonal(A, rng.uniform(0.5, 0.9, D))
-    # Ensure spectral radius < 1 for stability
-    eigvals = np.linalg.eigvals(A)
-    sr = np.max(np.abs(eigvals))
-    if sr >= 1.0:
-        A = A * (0.95 / sr)
 
-    # Emission matrix: block-diagonal, non-negative
-    C = np.zeros((N, D))
-    C[:Ne, :De] = rng.uniform(0.1, 1.0, (Ne, De))
-    C[Ne:, De:] = rng.uniform(0.1, 1.0, (Ni, Di))
+class CTDSSim:
+    def __init__(
+            self,
+            De: int,
+            Di: int,
+            Ne: int,
+            Ni: int
+    ):
 
-    # Noise covariances
-    Q = 0.1 * np.eye(D)
-    R = 0.5 * np.eye(N)
+        self.De = De
+        self.Di = Di
+        self.D = De + Di
 
-    # Initial state
-    mu0 = np.zeros((D, 1))
-    V0 = np.eye(D)
+        self.Ne = Ne
+        self.Ni = Ni
+        self.N = Ne + Ni
 
-    return dict(A=A, C=C, Q=Q, R=R, mu0=mu0, V0=V0)
+    def create_A_matrix(self):
+        A = np.zeros((self.D, self.D))
+        A[:, :self.De] = np.random.uniform(0, 1, size=(self.D, self.De))
+        A[:, self.De:] = -np.random.uniform(0, 1, size=(self.D, self.Di))
+        A /= (np.max(np.abs(np.linalg.eigvals(A))) + 0.5)
+        self.A = A
+
+    def create_C_matrix(self):
+        e2e_block = np.random.uniform(0, 1, (self.Ne, self.De))
+        e2i_block = np.zeros((self.Ni, self.De))
+        i2i_block = np.random.uniform(0, 1, (self.Ni, self.Di))
+        i2e_block = np.zeros((self.Ne, self.Di))
+
+        self.C = np.block(
+            [[e2e_block, i2e_block],
+             [e2i_block, i2i_block]]
+        )
+
+    def create_Q_matrix(self):
+        L = np.random.standard_normal((self.D, self.D))
+        self.Q = L @ L.T
+
+
+    def create_Q0_matrix(self):
+        L = np.random.standard_normal((self.D, self.D))
+        self.Q0 = L @ L.T
+
+    def create_mu0(self):
+        self.mu0 = np.random.standard_normal((self.D, 1))
+
+    def create_R_matrix(self):
+        self.R = np.diag(np.random.uniform(0.5, 2.0, self.N))
+
+
+    def get_A(self):
+        return self.A
+
+    def get_C(self):
+        return self.C
+
+    def get_Q(self):
+        return self.Q
+
+    def get_Q0(self):
+        return self.Q0
+
+    def get_mu0(self):
+        return self.mu0
+
+    def get_R(self):
+        return self.R
+
+    def get_params(self):
+        return self.A, self.C, self.Q, self.Q0, self.mu0, self.R
+
+    def create_params(self):
+        self.create_A_matrix()
+        self.create_C_matrix()
+        self.create_Q_matrix()
+        self.create_Q0_matrix()
+        self.create_mu0()
+        self.create_R_matrix()
+
+    def simulate(self, T: int, n_trials: int = 1):
+        lds = LinearDynamicalSystem(self.D, self.N)
+        lds.A = self.A
+        lds.C = self.C
+        lds.Q = self.Q
+        lds.Q0 = self.Q0
+        lds.mu0 = self.mu0
+        lds.R = self.R
+
+        x, y = lds.sample(T, n_trials)
+        return x, y

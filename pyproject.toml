@@ -7,7 +7,9 @@ dependencies = [
     "scipy",
     "matplotlib",
     "pandas",
-    "cvxpy"
+    "cvxpy",
+    "tqdm",
+    "scikit-learn"
 ]
 
 [project.optional-dependencies]

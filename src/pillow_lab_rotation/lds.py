@@ -7,11 +7,13 @@ class LinearDynamicalSystem:
             self,
             xdim: int,
             ydim: int,
-            udim: int | None = None
+            udim: int | None = None,
+            feedthrough: bool = True
     ):
         self.xdim = xdim
         self.ydim = ydim
         self.udim = udim if udim is not None else 0
+        self.feedthrough = feedthrough
         self.init_params()
 
     def init_params(self):
@@ -30,13 +32,18 @@ class LinearDynamicalSystem:
 
         # Input params
         self.B = np.random.randn(self.xdim, self.udim) if self.udim > 0 else np.zeros((self.xdim, self.udim))
-        self.D = np.random.randn(self.ydim, self.udim) if self.udim > 0 else np.zeros((self.ydim, self.udim))
+        if self.udim > 0 and self.feedthrough:
+            self.D = np.random.randn(self.ydim, self.udim)
+        else:
+            self.D = np.zeros((self.ydim, self.udim))
 
 
     def fit(
             self,
             observations: np.ndarray,
-            inputs: np.ndarray | None = None
+            inputs: np.ndarray | None = None,
+            verbose: bool = False,
+            max_iter: int | None = None
     ):
         '''
         Assumes observations is shape (n_trials, T, ydim, 1)
@@ -44,16 +51,24 @@ class LinearDynamicalSystem:
         self.observations = observations
         self.n_trials, self.T, _, _ = observations.shape
         self.inputs = inputs if inputs is not None else np.zeros((self.n_trials, self.T, self.udim, 1))
+        self.ll_history = []
         LL_old = -np.inf
+        iteration = 0
         while True:
             self.e_step()
             LL_new = self.LL
+            self.ll_history.append(LL_new)
+            if verbose:
+                print(f"Iteration {iteration}: LL = {LL_new:.6f}")
             if LL_new < LL_old:
                 raise ValueError('New LL less than old LL, implementation error')
-            if LL_new - LL_old < 1e-7:
+            if max_iter is None and LL_new - LL_old < 1e-5:
+                break
+            if max_iter is not None and iteration >= max_iter:
                 break
             LL_old = LL_new
             self.m_step()
+            iteration += 1
 
     def e_step(self):
         self.run_filter()
@@ -63,7 +78,10 @@ class LinearDynamicalSystem:
     def m_step(self):
         if self.udim > 0:
             self.update_A_B()
-            self.update_C_D()
+            if self.feedthrough:
+                self.update_C_D()
+            else:
+                self.update_C()
         else:
             self.update_A()
             self.update_C()
@@ -115,7 +133,7 @@ class LinearDynamicalSystem:
             # Accumulate LL
             quad = (innov[:, :, 0] @ P_obs_inv_all[t] * innov[:, :, 0]).sum()
             LL += -0.5 * (self.n_trials * (self.ydim * np.log(2 * np.pi) + log_det_all[t]) + quad)
-            
+
 
         self.P_predicted = np.broadcast_to(P_pred_all, (self.n_trials, self.T, self.xdim, self.xdim)).copy()
         self.P_filtered = np.broadcast_to(P_filt_all, (self.n_trials, self.T, self.xdim, self.xdim)).copy()
@@ -195,7 +213,7 @@ class LinearDynamicalSystem:
         self.Q0 = self.M11
         if self.udim > 0:
             self.Q0 = self.Q0 + self.B @ self.U11 @ self.B.T - self.B @ self.U_hat_11 - self.U_hat_11.T @ self.B.T
-        self.Q0 /= self.n_trials
+        self.Q0 = self.Q0 / self.n_trials - self.mu0 @ self.mu0.T
 
     def update_Q(self):
         Q = self.M2T + self.A @ self.M1Tm1 @ self.A.T - self.A @ self.M_delta - self.M_delta.T @ self.A.T
@@ -220,7 +238,7 @@ class LinearDynamicalSystem:
 
     def update_R(self):
         R = self.Y + self.C @ self.M1T @ self.C.T - self.C @ self.Y_hat - self.Y_hat.T @ self.C.T
-        if self.udim > 0:
+        if self.udim > 0 and self.feedthrough:
             R += (self.D @ self.U1T @ self.D.T
                   - self.D @ self.Uy - self.Uy.T @ self.D.T
                   + self.D @ self.U_hat_1T @ self.C.T + self.C @ self.U_hat_1T.T @ self.D.T)
@@ -241,9 +259,10 @@ class LinearDynamicalSystem:
         self.D = CD[:, self.xdim:]
 
 
-    def predict(self, Y: np.ndarray):
+    def predict(self, Y: np.ndarray, inputs: np.ndarray | None = None):
 
         trials, timesteps, _, _ = Y.shape
+        U = inputs if inputs is not None else np.zeros((trials, timesteps, self.udim, 1))
 
         # Covariance pass
         K_all = np.zeros((timesteps, self.xdim, self.ydim))
@@ -274,17 +293,38 @@ class LinearDynamicalSystem:
 
         xt = np.broadcast_to(self.mu0, (trials, self.xdim, 1)).copy()
         for t in range(timesteps):
-            xp = xt if t == 0 else (self.A @ xt)
+            ut = U[:, t]
+            xp = (xt + self.B @ ut) if t == 0 else (self.A @ xt + self.B @ ut)
             x_pred[:, t] = xp
-            innov = Y[:, t] - self.C @ xp
+            innov = Y[:, t] - self.C @ xp - self.D @ ut
             quad = (innov[:, :, 0] @ P_obs_inv_all[t] * innov[:, :, 0]).sum()
             LL += -0.5 * (trials * (self.ydim * np.log(2 * np.pi) + log_det_all[t]) + quad)
             xt = xp + K_all[t] @ innov
             x_filt[:, t] = xt
 
-        obs_mean = self.C @ x_pred
+        obs_mean = self.C @ x_pred + self.D @ U
         pred_covs = np.broadcast_to(P_pred_all, (trials, timesteps, self.xdim, self.xdim)).copy()
         obs_cov = np.broadcast_to(P_obs_all, (trials, timesteps, self.ydim, self.ydim)).copy()
         post_covs = np.broadcast_to(P_filt_all, (trials, timesteps, self.xdim, self.xdim)).copy()
 
         return x_pred, pred_covs, obs_mean, obs_cov, x_filt, post_covs, LL
+
+
+    def sample(self, T: int, n_trials: int = 1, inputs: np.ndarray | None = None):
+        U = inputs if inputs is not None else np.zeros((n_trials, T, self.udim, 1))
+
+        x = np.zeros((n_trials, T, self.xdim, 1))
+        y = np.zeros((n_trials, T, self.ydim, 1))
+
+        chol_Q0 = np.linalg.cholesky(self.Q0)
+        chol_Q = np.linalg.cholesky(self.Q)
+        chol_R = np.linalg.cholesky(self.R)
+
+        x[:, 0] = self.mu0 + chol_Q0 @ np.random.standard_normal((n_trials, self.xdim, 1))
+        y[:, 0] = self.C @ x[:, 0] + self.D @ U[:, 0] + chol_R @ np.random.standard_normal((n_trials, self.ydim, 1))
+
+        for t in range(1, T):
+            x[:, t] = self.A @ x[:, t - 1] + self.B @ U[:, t] + chol_Q @ np.random.standard_normal((n_trials, self.xdim, 1))
+            y[:, t] = self.C @ x[:, t] + self.D @ U[:, t] + chol_R @ np.random.standard_normal((n_trials, self.ydim, 1))
+
+        return x, y

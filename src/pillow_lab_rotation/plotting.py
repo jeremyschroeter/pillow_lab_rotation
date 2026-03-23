@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mc
 
 def plot_confidence_ellipse(M, V):
     """
@@ -54,3 +55,108 @@ def plot_confidence_ellipse(M, V):
     plt.plot(M[0], M[1], 'r+')
     plt.plot(contour_1[:,0], contour_1[:,1], 'b-', linewidth=0.5, c='k')
     plt.plot(contour_2[:,0], contour_2[:,1], 'b-', linewidth=0.5, c='k')
+
+
+def _diverging_norm(data, vmin_override=None):
+    vmin = vmin_override if vmin_override is not None else np.min(data)
+    vmax = np.max(data)
+    if vmin >= 0:
+        vmin = -vmax if vmax > 0 else -1
+    if vmax <= 0:
+        vmax = -vmin if vmin < 0 else 1
+    return mc.TwoSlopeNorm(vmax=vmax, vcenter=0, vmin=vmin)
+
+
+def plot_ctds_matrices(A: np.ndarray, C: np.ndarray, Q: np.ndarray, R: np.ndarray):
+    fig = plt.figure(figsize=(10, 6))
+
+    # Plot A
+    axA = fig.add_subplot(221)
+    axA.matshow(A, cmap='bwr', norm=_diverging_norm(A))
+    axA.set(title='$A$', xlabel='$D$', ylabel='$D$')
+
+    # Plot Q
+    axQ = fig.add_subplot(223)
+    axQ.matshow(Q, cmap='bwr', norm=_diverging_norm(Q))
+    axQ.set(title='$Q$', xlabel='$D$', ylabel='$D$')
+
+    # Plot C
+    axC = fig.add_subplot(222)
+    axC.matshow(C, cmap='bwr', norm=_diverging_norm(C, vmin_override=-1))
+    axC.set(title='$C$', xlabel='$D$', ylabel='$N$')
+
+    # Plot R
+    axR = fig.add_subplot(224)
+    axR.matshow(R, cmap='bwr', norm=_diverging_norm(R, vmin_override=-1))
+    axR.set(title='$R$', xlabel='$N$', ylabel='$N$')
+
+    for ax in [axA, axC, axR, axQ]:
+        ax.set_xticks([], [])
+        ax.set_yticks([], [])
+        for spine in ['top', 'right']:
+            ax.spines[spine].set_visible(True)
+
+    fig.suptitle('Simulated Data Matrices')
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_trajectories(
+        x_true: np.ndarray,
+        x_fit: np.ndarray,
+        y_true: np.ndarray,
+        y_fit: np.ndarray,
+        De: int,
+        Ne: int,
+        trial: int = 0
+):
+    """
+    Compare ground truth and fitted trajectories for latents and observations.
+    2 columns: latents on top, observations on bottom.
+    Excitatory dimensions are red, inhibitory dimensions are blue.
+    """
+    D = x_true.shape[2]
+    N = y_true.shape[2]
+    ncols = 2
+    lat_rows = int(np.ceil(D / ncols))
+    obs_rows = int(np.ceil(N / ncols))
+    nrows = lat_rows + obs_rows
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 2 * nrows), sharex=True)
+
+    # Latents
+    for d in range(D):
+        row = d // ncols
+        col = d % ncols
+        ax = axes[row, col]
+        color = 'r' if d < De else 'b'
+        ax.plot(x_true[trial, :, d, 0], label='True', alpha=0.7, c=color)
+        ax.plot(x_fit[trial, :, d, 0], label='Fitted', linestyle='--', alpha=0.7, c=color)
+        ax.set_ylabel(f'$x_{{{d+1}}}$')
+        if d == 0:
+            ax.legend(loc='upper right')
+            ax.set_title('Latents')
+
+    # Hide unused latent axes
+    for d in range(D, lat_rows * ncols):
+        axes[d // ncols, d % ncols].set_visible(False)
+
+    # Observations
+    for n in range(N):
+        row = lat_rows + n // ncols
+        col = n % ncols
+        ax = axes[row, col]
+        color = 'r' if n < Ne else 'b'
+        ax.plot(y_true[trial, :, n, 0], label='True', alpha=0.7, c=color)
+        ax.plot(y_fit[trial, :, n, 0], label='Fitted', linestyle='--', alpha=0.7, c=color)
+        ax.set_ylabel(f'$y_{{{n+1}}}$')
+        if n == 0:
+            ax.legend(loc='upper right')
+            ax.set_title('Observations')
+
+    # Hide unused observation axes
+    for n in range(N, obs_rows * ncols):
+        axes[lat_rows + n // ncols, n % ncols].set_visible(False)
+
+    fig.tight_layout()
+    plt.show()

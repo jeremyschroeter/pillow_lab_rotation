@@ -31,16 +31,7 @@ class CTDS:
 
         # Latent params
         self.A = np.zeros((self.D, self.D))
-        # E columns: small positive off-diagonal
-        self.A[:, :self.De] = np.random.uniform(0, 0.1, (self.D, self.De))
-        # I columns: small negative off-diagonal
-        self.A[:, self.De:] = -np.random.uniform(0, 0.1, (self.D, self.Di))
-        # Diagonal: positive autocorrelation
-        np.fill_diagonal(self.A, np.random.uniform(0.5, 0.9, self.D))
-        # Ensure spectral radius < 1
-        sr = np.max(np.abs(np.linalg.eigvals(self.A)))
-        if sr >= 1.0:
-            self.A *= 0.95 / sr
+
         self.Q = np.eye(self.D)
 
         # Observation params
@@ -76,7 +67,7 @@ class CTDS:
         self.C_nonneg_idx = C_nonneg_mask.flatten(order='F')
         self.C_zero_idx = ~C_nonneg_mask.flatten(order='F')
 
-    def fit(self, data: np.ndarray):
+    def fit(self, data: np.ndarray, verbose: bool = False, max_iters: int = np.inf):
         '''
         Assume data is shape (n_trials, T, ydim, 1)
         '''
@@ -84,16 +75,26 @@ class CTDS:
         self.n_trials, self.T, _, _ = data.shape
 
         # EM
+        self.ll_history = []
         LL_old = -np.inf
+        iteration = 0
         while True:
             self.e_step()
-            self.m_step()
-            LL_new = self.log_likelihood()
+            LL_new = self.LL
+            self.ll_history.append(LL_new)
             if LL_new < LL_old:
                 raise ValueError('New LL less than old LL, implementation error')
-            if LL_new - LL_old < 1e-7:
+            if LL_new - LL_old < 1e-5:
                 break
             LL_old = LL_new
+            self.m_step()
+            iteration += 1
+            if verbose:
+                print(f'Iteration {iteration}')
+                print(f'LL: {LL_old:0.5f}')
+            if max_iters is not np.inf and iteration > max_iters:
+                break
+
     
     def e_step(self):
         self.run_filter()
@@ -221,10 +222,18 @@ class CTDS:
         self.V0 = self.M11 / self.n_trials - self.mu0 @ self.mu0.T
     
     def update_A(self):
+        # Solve quad programming problem
+        # A.T K A + q A
         A = cp.Variable(self.D * self.D)
         Q_inv = inv(self.Q)
-        q = np.kron(self.M_delta.T, np.eye(self.D)).T @ vec(Q_inv)
-        objective = cp.Maximize(q @ A - 0.5 * cp.quad_form(A, np.kron(self.M1Tm1.T, Q_inv)))
+        Q_tilde = Q_inv / np.max(np.abs(Q_inv))
+        L = np.linalg.cholesky(Q_tilde)
+
+        # Equation 80 from Adithis doc
+        K = np.kron(np.eye(self.D), L) @ np.kron(self.M1Tm1, np.eye(self.D)) @ (np.kron(np.eye(self.D), L.T))
+        q = vec(Q_tilde.T @ self.M_delta.T)
+
+        objective = cp.Maximize(q.T @ A - 0.5 * cp.quad_form(A, K))
         constraints = [
             A[self.A_pos_idx] >= 0,
             A[self.A_neg_idx] <= 0
@@ -237,21 +246,29 @@ class CTDS:
         self.Q = (1 / (self.n_trials*(self.T - 1))) * (self.M2T - self.A @ self.M_delta - self.M_delta.T @ self.A.T + self.A @ self.M1Tm1 @ self.A.T)
     
     def update_C(self):
-        
-        C = cp.Variable(self.N * self.D)
-        R_inv = inv(self.R)
-        q = np.kron(self.Y_hat, np.eye(self.N)) @ vec(R_inv)
-        objective = cp.Maximize(q @ C - 0.5 * cp.quad_form(C, np.kron(self.M1T.T, R_inv)))
-        constraints = [
-            C[self.C_nonneg_idx] >= 0,
-            C[self.C_zero_idx] == 0
-        ]
-        prob = cp.Problem(objective, constraints)
-        result = prob.solve(solver=cp.MOSEK, verbose=False)
-        self.C = C.value.reshape(self.C.shape, order='F')
+        rows = []
+        for n in range(self.N):
+            if n < self.Ne:
+                c_n = cp.Variable(self.De)
+                P = self.M1T[:self.De, :self.De]
+                q = self.Y_hat[:self.De, n]
+            else:
+                c_n = cp.Variable(self.Di)
+                P = self.M1T[self.De:, self.De:]
+                q = self.Y_hat[self.De:, n]
+            objective = cp.Minimize(0.5 * cp.quad_form(c_n, P) - q.T @ c_n)
+            prob = cp.Problem(objective, [c_n >= 0])
+            prob.solve(solver=cp.MOSEK, verbose=False)
+            if n < self.Ne:
+                rows.append(np.hstack([c_n.value, np.zeros(self.Di)]))
+            else:
+                rows.append(np.hstack([np.zeros(self.De), c_n.value]))
+
+        self.C = np.array(rows)
     
     def update_R(self):
         self.R = (1 / (self.T*self.n_trials)) * (self.Y - self.C@self.Y_hat - self.Y_hat.T @ self.C.T + self.C @ self.M1T @ self.C.T)
+        self.R = np.diag(np.diag(self.R))
     
     def log_likelihood(self):
         return self.LL
