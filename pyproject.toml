@@ -9,7 +9,9 @@ dependencies = [
     "pandas",
     "cvxpy",
     "tqdm",
-    "scikit-learn"
+    "scikit-learn",
+    "scikit-image",
+    "mosek>=11.1.10",
 ]
 
 [project.optional-dependencies]

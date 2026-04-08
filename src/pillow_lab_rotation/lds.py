@@ -43,7 +43,8 @@ class LinearDynamicalSystem:
             observations: np.ndarray,
             inputs: np.ndarray | None = None,
             verbose: bool = False,
-            max_iter: int | None = None
+            max_iter: int | None = None,
+            criterion: float = 1e-8
     ):
         '''
         Assumes observations is shape (n_trials, T, ydim, 1)
@@ -62,7 +63,7 @@ class LinearDynamicalSystem:
                 print(f"Iteration {iteration}: LL = {LL_new:.6f}")
             if LL_new < LL_old:
                 raise ValueError('New LL less than old LL, implementation error')
-            if max_iter is None and LL_new - LL_old < 1e-5:
+            if max_iter is None and LL_new - LL_old < criterion:
                 break
             if max_iter is not None and iteration >= max_iter:
                 break
@@ -85,7 +86,7 @@ class LinearDynamicalSystem:
         else:
             self.update_A()
             self.update_C()
-        self.update_μ_and_V()
+        self.update_mu_and_Q0()
         self.update_Q()
         self.update_R()
 
@@ -126,7 +127,10 @@ class LinearDynamicalSystem:
             x_pred[:, t] = xp
 
             # Update
-            innov = yt - self.C @ xp - self.D @ ut
+            if self.feedthrough:
+                innov = yt - self.C @ xp - self.D @ ut
+            else:
+                innov = yt - self.C @ xp
             xt = xp + K_all[t] @ innov
             x_filt[:, t] = xt
 
@@ -208,8 +212,11 @@ class LinearDynamicalSystem:
 
 
 
-    def update_μ_and_V(self):
+    def update_mu_and_Q0(self):
         self.mu0 = self.m[:, 0, :, 0].mean(0, keepdims=True).T
+        if self.udim > 0:
+            u1_mean = self.inputs[:, 0, :, 0].mean(0, keepdims=True).T
+            self.mu0 = self.mu0 - self.B @ u1_mean
         self.Q0 = self.M11
         if self.udim > 0:
             self.Q0 = self.Q0 + self.B @ self.U11 @ self.B.T - self.B @ self.U_hat_11 - self.U_hat_11.T @ self.B.T
@@ -320,7 +327,7 @@ class LinearDynamicalSystem:
         chol_Q = np.linalg.cholesky(self.Q)
         chol_R = np.linalg.cholesky(self.R)
 
-        x[:, 0] = self.mu0 + chol_Q0 @ np.random.standard_normal((n_trials, self.xdim, 1))
+        x[:, 0] = self.mu0 + self.B @ U[:, 0] + chol_Q0 @ np.random.standard_normal((n_trials, self.xdim, 1))
         y[:, 0] = self.C @ x[:, 0] + self.D @ U[:, 0] + chol_R @ np.random.standard_normal((n_trials, self.ydim, 1))
 
         for t in range(1, T):

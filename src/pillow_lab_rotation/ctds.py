@@ -1,55 +1,46 @@
 import numpy as np
 import cvxpy as cp
-from numpy.linalg import inv, slogdet
+from numpy.linalg import inv
 from pillow_lab_rotation.tools import vec
+from pillow_lab_rotation.lds import LinearDynamicalSystem
+from pillow_lab_rotation.eirnn import EIRNNInit
 
-class CTDS:
+
+
+class CTDS(LinearDynamicalSystem):
     def __init__(
             self,
             De: int,
             Di: int,
             Ne: int,
-            Ni: int
+            Ni: int,
+            udim: int = 0
     ):
-        
         self.De = De
         self.Di = Di
-        self.D = De + Di
-
         self.Ne = Ne
         self.Ni = Ni
+        # D = total latent dim, N = total observation dim
+        self.D = De + Di
         self.N = Ne + Ni
+        # Initialize the parent LDS with inputs to latents only (no feedthrough)
+        super().__init__(xdim=self.D, ydim=self.N, udim=udim, feedthrough=False)
+        self.init_constraints()
 
-        self._init_params()
-        self._init_constraints()
-    
-    def _init_params(self):
+    def init_constraints(self):
+        """Build index masks for the sign constraints on A and C.
 
-        # Initial state params
-        self.mu0 = np.random.standard_normal((self.D, 1))
-        self.V0 = np.eye(self.D)
+        A constraints (Dale's law):
+          - Excitatory columns (first De cols): off-diagonal entries >= 0
+          - Inhibitory columns (last Di cols): off-diagonal entries <= 0
+          - Diagonal entries: unconstrained (or zero — your choice)
 
-        # Latent params
-        self.A = np.zeros((self.D, self.D))
+        C constraints:
+          - Block diagonal: C[:Ne, :De] >= 0, C[Ne:, De:] >= 0
+          - Off-diagonal blocks are zero
+        """
 
-        self.Q = np.eye(self.D)
-
-        # Observation params
-        e2e_block = np.random.uniform(0, 1, (self.Ne, self.De))
-        e2i_block = np.zeros((self.Ni, self.De))
-        i2i_block = np.random.uniform(0, 1, (self.Ni, self.Di))
-        i2e_block = np.zeros((self.Ne, self.Di))
-
-        self.C = np.block(
-            [[e2e_block, i2e_block],
-             [e2i_block, i2i_block]]
-        )
-        self.R = np.eye(self.N)
-
-    def _init_constraints(self):
-        '''
-        K is the sign constrainer on A
-        '''
+        # A constraints
         A_mask = np.zeros((self.D, self.D))
         A_mask[:, :self.De] = 1
         A_mask[:, self.De:] = -1
@@ -57,183 +48,128 @@ class CTDS:
         A_mask[diag_idx, diag_idx] = 0
 
         A_flat = A_mask.flatten(order='F')
-        self.A_pos_idx = A_flat > 0
-        self.A_neg_idx = A_flat < 0
+        # Pad with zeros for the B portion so masks work on vec([A, B])
+        B_pad = np.zeros(self.udim * self.D)
+        A_flat_padded = np.concatenate([A_flat, B_pad])
+        self.A_pos_idx = A_flat_padded > 0
+        self.A_neg_idx = A_flat_padded < 0
 
-        C_nonneg_mask = np.zeros((self.N, self.D), dtype=bool)
+        # C constraints
+        C_nonneg_mask = np.zeros((self.D, self.D), dtype=bool)
         C_nonneg_mask[:self.Ne, :self.De] = True
         C_nonneg_mask[self.Ne:, self.De:] = True
 
         self.C_nonneg_idx = C_nonneg_mask.flatten(order='F')
         self.C_zero_idx = ~C_nonneg_mask.flatten(order='F')
 
-    def fit(self, data: np.ndarray, verbose: bool = False, max_iters: int = np.inf):
-        '''
-        Assume data is shape (n_trials, T, ydim, 1)
-        '''
-        self.data = data
-        self.n_trials, self.T, _, _ = data.shape
+    def init_params(self, observations: np.ndarray|None=None, start_seed: int=0):
+        """
+        Initialize CTDS parameters.
 
-        # EM
-        self.ll_history = []
-        LL_old = -np.inf
-        iteration = 0
-        while True:
-            self.e_step()
-            LL_new = self.LL
-            self.ll_history.append(LL_new)
-            if LL_new < LL_old:
-                raise ValueError('New LL less than old LL, implementation error')
-            if LL_new - LL_old < 1e-5:
-                break
-            LL_old = LL_new
-            self.m_step()
-            iteration += 1
-            if verbose:
-                print(f'Iteration {iteration}')
-                print(f'LL: {LL_old:0.5f}')
-            if max_iters is not np.inf and iteration > max_iters:
-                break
+        If observations are provided, uses a structured initialization:
+            1. Regress J from consecutive observations: y_{t+1} = J y_t
+            subject to Dale's law sign constraints on columns of J.
+            2. Decompose J ≈ UV via NMF split by cell type, yielding
+            C = U  (N x D, block-diagonal non-negative)
+            A = VU (D x D, Dale's law signs)
+            3. Invert observations through C to estimate latent states,
+            then fit mu0, Q0, Q, and R from residual statistics.
 
-    
-    def e_step(self):
-        self.run_filter()
-        self.run_smoother()
-        self._get_sufficient_stats()
+        If observations are None, falls back to random initialization
+        respecting the structural constraints.
+
+        Parameters
+        ----------
+        observations : np.ndarray or None
+            Shape (n_trials, T, N, 1). Neural recordings used for
+            data-driven initialization. If None, uses random init.
+        start_seed : int
+            Base random seed for NMF restarts. Each of the 10 restarts
+            uses start_seed + i.
+        """
+        # Base params shared by both branches
+        # (can't call super().init_params() because it overwrites self.D
+        #  which is the latent dim integer here, not the feedthrough matrix)
+        self.mu0 = np.random.standard_normal((self.D, 1))
+        self.Q0 = np.eye(self.D)
+        self.Q = np.eye(self.D)
+        self.B = np.random.randn(self.D, self.udim) if self.udim > 0 else np.zeros((self.D, self.udim))
+
+        if observations is not None:
+            init = EIRNNInit(self.Ne, self.Ni, self.De, self.Di)
+            init.fit(observations, start_seed=start_seed)
+            self.A = init.A
+            self.C = init.C
+            self.R = init.R
+            self.Q = init.Q
+            self.mu0 = init.mu0
+            self.Q0 = init.Q0
+
+        else:
+            self.A = np.zeros((self.D, self.D))
+
+            e2e_block = np.random.uniform(0, 1, (self.Ne, self.De))
+            e2i_block = np.zeros((self.Ni, self.De))
+            i2i_block = np.random.uniform(0, 1, (self.Ni, self.Di))
+            i2e_block = np.zeros((self.Ne, self.Di))
+
+            self.C = np.block(
+                [[e2e_block, i2e_block],
+                [e2i_block, i2i_block]]
+            )
+            self.R = np.eye(self.N)
+
+    # -------------------------------------------------------------------------
+    # Inherited from LDS (no changes needed):
+    #   - fit()
+    #   - e_step()
+    #   - run_filter()          (handles inputs via B)
+    #   - run_smoother()
+    #   - _get_sufficient_stats()  (computes input-related stats when udim > 0)
+    #   - update_mu_and_Q0()     (handles Q0 and mu0, accounts for B)
+    #   - update_Q()            (accounts for B when udim > 0)
+    #   - predict()
+    #   - sample()
+    # -------------------------------------------------------------------------
 
     def m_step(self):
-        self.update_mu()
-        self.update_V()
-        self.update_A()
-        self.update_C()
+        """Override to call the constrained update methods.
+
+        When udim > 0, A and B are updated jointly via update_A_B().
+        Otherwise, A is updated alone via update_A().
+        C always uses the constrained update (no feedthrough, so no D).
+        """
+        if self.udim > 0:
+            self.update_A_B()
+            self.update_C()
+        else:
+            self.update_A()
+            self.update_C()
+        self.update_mu_and_Q0()
         self.update_Q()
         self.update_R()
 
-    def run_filter(self):
-        '''
-        Vectorized Kalman filter. Modified from lds.py
-        Also computes the LL in parallel
-        '''
-
-        # Covariance pass (same across trials)
-        K_all = np.zeros((self.T, self.D, self.N))
-        P_pred_all = np.zeros((self.T, self.D, self.D))
-        P_filt_all = np.zeros((self.T, self.D, self.D))
-        P_obs_inv_all = np.zeros((self.T, self.N, self.N))
-        log_det_all = np.zeros(self.T)
-
-        Pt = self.V0
-        for t in range(self.T):
-
-            # Evolve latents
-            P_pred = Pt if t == 0 else self.A @ Pt @ self.A.T + self.Q
-            P_pred_all[t] = P_pred
-
-            # Predict observations
-            P_obs = self.C @ P_pred @ self.C.T + self.R
-            P_obs_inv = inv(P_obs)
-            P_obs_inv_all[t] = P_obs_inv
-            _, log_det_all[t] = slogdet(P_obs)
-            
-            # Update
-            K = P_pred @ self.C.T @ P_obs_inv
-            K_all[t] = K
-            Pt = P_pred - K @ self.C @ P_pred
-            P_filt_all[t] = Pt
-        
-        # Mean pass (vectorized across trials)
-        x_filt = np.zeros((self.n_trials, self.T, self.D, 1))
-        x_pred = np.zeros((self.n_trials, self.T, self.D, 1))
-        LL = 0.0
-
-        xt = np.broadcast_to(self.mu0, (self.n_trials, self.D, 1)).copy()
-        for t in range(self.T):
-            xp = xt if t == 0 else (self.A @ xt)
-            x_pred[:, t] = xp
-            innov = self.data[:, t] - self.C @ xp
-            quad = (innov[:, :, 0] @ P_obs_inv_all[t] * innov[:, :, 0]).sum()
-            LL += -0.5 * (self.n_trials * (self.N * np.log(2 * np.pi) + log_det_all[t]) + quad)
-            xt = xp + K_all[t] @ innov
-            x_filt[:, t] = xt
-
-        self.P_predicted = np.broadcast_to(P_pred_all, (self.n_trials, self.T, self.D, self.D)).copy()
-        self.P_filtered = np.broadcast_to(P_filt_all, (self.n_trials, self.T, self.D, self.D)).copy()
-        self.x_filtered = x_filt
-        self.x_predicted = x_pred
-        self.LL = LL / (self.n_trials * self.T)
-    
-    def run_smoother(self):
-        '''
-        Vectorized smoother
-        '''
-
-        # Covariance pass (same for all trials)
-        J_all = np.zeros((self.T - 1, self.D, self.D))
-        P_smooth_all = np.zeros((self.T, self.D, self.D))
-        sigma_x_all = np.zeros((self.T, self.D, self.D))
-
-        P_smooth_all[-1] = self.P_filtered[0, -1]
-
-        for t in range(self.T - 2, -1, -1):
-            P_filt_t = self.P_filtered[0, t]
-            P_pred_tp1 = self.P_predicted[0, t + 1]
-
-            J = P_filt_t @ self.A.T @ inv(P_pred_tp1)
-            J_all[t] = J
-            P_smooth_all[t] = P_filt_t + J @ (P_smooth_all[t + 1] - P_pred_tp1) @ J.T
-            sigma_x_all[t + 1] = J @ P_smooth_all[t + 1]
-
-        # Mean pass (vectorized across trials)
-        m = np.zeros((self.n_trials, self.T, self.D, 1))
-        m[:, -1] = self.x_filtered[:, -1]
-
-        for t in range(self.T - 2, -1, -1):
-            m[:, t] = self.x_filtered[:, t] + J_all[t] @ (m[:, t + 1] - self.x_predicted[:, t + 1])
-
-        self.m = m
-        self.sigma = np.broadcast_to(P_smooth_all, (self.n_trials, self.T, self.D, self.D)).copy()
-        self.sigma_x = np.broadcast_to(sigma_x_all, (self.n_trials, self.T, self.D, self.D)).copy()
-
-    def _get_sufficient_stats(self):
-        m = self.m[..., 0]
-        y = self.data[..., 0]
-
-        def _second_moment(m_slice, sigma_slice):
-            flat = m_slice.reshape(-1, self.D)
-            return flat.T @ flat + sigma_slice.reshape(-1, self.D, self.D).sum(0)
-        
-        def _cross_moment(a, b):
-            return a.reshape(-1, a.shape[-1]).T @ b.reshape(-1, b.shape[-1])
-
-        self.M11 = _second_moment(m[:, :1], self.sigma[:, :1])
-        self.M2T = _second_moment(m[:, 1:], self.sigma[:, 1:])
-        self.M1Tm1 = _second_moment(m[:, :-1], self.sigma[:, :-1])
-        self.M1T = self.M11 + self.M2T
-
-        self.M_delta = _cross_moment(m[:, :-1], m[:, 1:]) + self.sigma_x[:, 1:].reshape(-1, self.D, self.D).sum(0)
-
-        self.Y = _cross_moment(y, y)
-        self.Y_hat = _cross_moment(m, y)
-
-    def update_mu(self):
-        self.mu0 = self.m[:, 0, :, 0].mean(0, keepdims=True).T
-    
-    def update_V(self):
-        self.V0 = self.M11 / self.n_trials - self.mu0 @ self.mu0.T
-    
     def update_A(self):
-        # Solve quad programming problem
-        # A.T K A + q A
+        """Constrained update for A using quadratic programming (Dale's law).
+
+        Maximize:  vec(Q^{-1} M_delta)^T vec(A) - 0.5 vec(A)^T K vec(A)
+        where K = I ⊗ (Q^{-1} M_{1:T-1})
+        subject to sign constraints from self.A_pos_idx, self.A_neg_idx.
+
+        Hint: use cvxpy with cp.quad_form and index into the flattened
+        (column-major / Fortran order) variable.
+        """
+        # Solve QP problem: A.T K A + q A
         A = cp.Variable(self.D * self.D)
         Q_inv = inv(self.Q)
         Q_tilde = Q_inv / np.max(np.abs(Q_inv))
         L = np.linalg.cholesky(Q_tilde)
 
         # Equation 80 from Adithis doc
-        K = np.kron(np.eye(self.D), L) @ np.kron(self.M1Tm1, np.eye(self.D)) @ (np.kron(np.eye(self.D), L.T))
+        K = np.kron(np.eye(self.D), L) @ np.kron(self.M1Tm1, np.eye(self.D)) @ np.kron(np.eye(self.D), L.T)
         q = vec(Q_tilde.T @ self.M_delta.T)
 
-        objective = cp.Maximize(q.T @ A - 0.5 * cp.quad_form(A, K))
+        objective = cp.Maximize(q.T @ A - 0.5 * cp.quad_form(A, cp.psd_wrap(K)))
         constraints = [
             A[self.A_pos_idx] >= 0,
             A[self.A_neg_idx] <= 0
@@ -241,11 +177,56 @@ class CTDS:
         prob = cp.Problem(objective, constraints)
         result = prob.solve(solver=cp.MOSEK, verbose=False)
         self.A = A.value.reshape(self.A.shape, order='F')
-    
-    def update_Q(self):
-        self.Q = (1 / (self.n_trials*(self.T - 1))) * (self.M2T - self.A @ self.M_delta - self.M_delta.T @ self.A.T + self.A @ self.M1Tm1 @ self.A.T)
-    
+
+    def update_A_B(self):
+        """Constrained joint update for A and B.
+
+        Same QP structure as update_A, but the optimization variable is
+        vec([A, B]) and the sufficient statistics include input terms.
+        Sign constraints apply only to the A portion of the variable.
+        B is unconstrained.
+        """
+        # Equation 86 from Adithis notes
+        A_tilde = cp.Variable(self.D * self.D + self.udim * self.D)
+        Q_inv = inv(self.Q)
+        Q_tilde = Q_inv / np.max(np.abs(Q_inv))
+        L = np.linalg.cholesky(Q_tilde)
+
+        # See equation 87 in Adithis notes
+        M_delta_tilde = np.vstack([self.M_delta, self.U_hat_2T])
+        M_tilde_1Tm1 = np.block(
+            [[self.M1Tm1, self.U_delta.T],
+             [self.U_delta, self.U2T]]
+        )
+
+        K = np.kron(np.eye(self.D + self.udim), L) @ np.kron(M_tilde_1Tm1, np.eye(self.D)) @ np.kron(np.eye(self.D + self.udim), L.T)
+        q = vec(Q_tilde.T @ M_delta_tilde.T)
+
+        objective = cp.Maximize(q.T @ A_tilde - 0.5 * cp.quad_form(A_tilde, cp.psd_wrap(K)))
+        constraints = [
+            A_tilde[self.A_pos_idx] >= 0,
+            A_tilde[self.A_neg_idx] <= 0
+        ]
+        prob = cp.Problem(objective, constraints)
+        result = prob.solve(solver=cp.MOSEK, verbose=False)
+        AB = A_tilde.value
+        A = AB[:self.D * self.D]
+        B = AB[self.D * self.D:]
+        self.A = A.reshape(self.A.shape, order='F')
+        self.B = B.reshape(self.D, self.udim, order='F')
+
+
+
     def update_C(self):
+        """Constrained update for C with block-diagonal non-negativity.
+
+        Each row c_n of C is solved independently:
+          - If n < Ne: c_n has De free (non-negative) entries, Di zeros
+          - If n >= Ne: c_n has De zeros, Di free (non-negative) entries
+
+        Minimize:  0.5 c_n^T P c_n - q^T c_n   s.t.  c_n >= 0
+        where P and q are the relevant sub-blocks of M1T and Y_hat.
+        """
         rows = []
         for n in range(self.N):
             if n < self.Ne:
@@ -256,67 +237,22 @@ class CTDS:
                 c_n = cp.Variable(self.Di)
                 P = self.M1T[self.De:, self.De:]
                 q = self.Y_hat[self.De:, n]
-            objective = cp.Minimize(0.5 * cp.quad_form(c_n, P) - q.T @ c_n)
+            objective = cp.Minimize(0.5 * cp.quad_form(c_n, cp.psd_wrap(P)) - q.T @ c_n)
             prob = cp.Problem(objective, [c_n >= 0])
             prob.solve(solver=cp.MOSEK, verbose=False)
             if n < self.Ne:
                 rows.append(np.hstack([c_n.value, np.zeros(self.Di)]))
             else:
                 rows.append(np.hstack([np.zeros(self.De), c_n.value]))
-
         self.C = np.array(rows)
-    
+
     def update_R(self):
-        self.R = (1 / (self.T*self.n_trials)) * (self.Y - self.C@self.Y_hat - self.Y_hat.T @ self.C.T + self.C @ self.M1T @ self.C.T)
-        self.R = np.diag(np.diag(self.R))
-    
-    def log_likelihood(self):
-        return self.LL
-    
-    def predict(self, Y: np.ndarray):
+        """Update R with diagonal constraint.
 
-        trials, timesteps, _, _ = Y.shape
+        Same formula as the LDS update_R, but then set off-diagonal to zero:
+            R = diag(diag(R))
+        """
+        normalizer = (1 / (self.T * self.n_trials))
+        unnormalized = (self.Y - self.C@self.Y_hat - self.Y_hat.T @ self.C.T + self.C @ self.M1T @ self.C.T)
 
-        # Covariance pass
-        K_all = np.zeros((timesteps, self.D, self.N))
-        P_pred_all = np.zeros((timesteps, self.D, self.D))
-        P_filt_all = np.zeros((timesteps, self.D, self.D))
-        P_obs_all = np.zeros((timesteps, self.N, self.N))
-        P_obs_inv_all = np.zeros((timesteps, self.N, self.N))
-        log_det_all = np.zeros(timesteps)
-
-        Pt = self.V0
-        for t in range(timesteps):
-            P_pred = Pt if t == 0 else self.A @ Pt @ self.A.T + self.Q
-            P_pred_all[t] = P_pred
-            P_obs = self.C @ P_pred @ self.C.T + self.R
-            P_obs_all[t] = P_obs
-            P_obs_inv = inv(P_obs)
-            P_obs_inv_all[t] = P_obs_inv
-            _, log_det_all[t] = slogdet(P_obs)
-            K = P_pred @ self.C.T @ P_obs_inv
-            K_all[t] = K
-            Pt = P_pred - K @ self.C @ P_pred
-            P_filt_all[t] = Pt
-
-        # Mean pass (vectorized across trials, computes log-likelihood)
-        x_pred = np.zeros((trials, timesteps, self.D, 1))
-        x_filt = np.zeros((trials, timesteps, self.D, 1))
-        LL = 0.0
-
-        xt = np.broadcast_to(self.mu0, (trials, self.D, 1)).copy()
-        for t in range(timesteps):
-            xp = xt if t == 0 else (self.A @ xt)
-            x_pred[:, t] = xp
-            innov = Y[:, t] - self.C @ xp
-            quad = (innov[:, :, 0] @ P_obs_inv_all[t] * innov[:, :, 0]).sum()
-            LL += -0.5 * (trials * (self.N * np.log(2 * np.pi) + log_det_all[t]) + quad)
-            xt = xp + K_all[t] @ innov
-            x_filt[:, t] = xt
-
-        obs_mean = self.C @ x_pred
-        pred_covs = np.broadcast_to(P_pred_all, (trials, timesteps, self.D, self.D)).copy()
-        obs_cov = np.broadcast_to(P_obs_all, (trials, timesteps, self.N, self.N)).copy()
-        post_covs = np.broadcast_to(P_filt_all, (trials, timesteps, self.D, self.D)).copy()
-
-        return x_pred, pred_covs, obs_mean, obs_cov, x_filt, post_covs, LL
+        self.R = np.diag(np.diag(normalizer * unnormalized))

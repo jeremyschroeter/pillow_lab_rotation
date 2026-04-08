@@ -57,6 +57,83 @@ def plot_confidence_ellipse(M, V):
     plt.plot(contour_2[:,0], contour_2[:,1], 'b-', linewidth=0.5, c='k')
 
 
+def plot_2d_trajectories(
+        x_mean: np.ndarray,
+        x_cov: np.ndarray,
+        observations: np.ndarray,
+        inputs: np.ndarray | None = None,
+        trials: list[int] | None = None,
+        ellipse_every: int = 3,
+        input_scale: float = 0.3,
+        ax: plt.Axes | None = None,
+):
+    """
+    Plot 2D latent trajectories with confidence ellipses and input arrows.
+
+    Args:
+        x_mean: smoothed/filtered means, shape (n_trials, T, 2, 1)
+        x_cov: covariance matrices, shape (n_trials, T, 2, 2)
+        observations: observed data, shape (n_trials, T, 2, 1)
+        inputs: input signals, shape (n_trials, T, udim, 1). Arrows drawn for first 2 dims.
+        trials: which trial indices to plot. Defaults to first 5.
+        ellipse_every: draw an ellipse every N timesteps
+        input_scale: scale factor for input arrows
+        ax: axes to plot on. Created if None.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 7))
+    if trials is None:
+        trials = list(range(min(5, x_mean.shape[0])))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trials)))
+
+    for idx, trial in enumerate(trials):
+        c = colors[idx]
+        m = x_mean[trial, :, :, 0]  # (T, 2)
+        y = observations[trial, :, :, 0]  # (T, 2)
+
+        # Plot observations as faint dots
+        ax.scatter(y[:, 0], y[:, 1], color=c, alpha=0.15, s=10, zorder=1)
+
+        # Plot smoothed trajectory
+        ax.plot(m[:, 0], m[:, 1], color=c, alpha=0.8, lw=1.5, zorder=2)
+        ax.scatter(m[0, 0], m[0, 1], color=c, marker='o', s=40, zorder=4)
+
+        # Confidence ellipses
+        T = x_mean.shape[1]
+        for t in range(0, T, ellipse_every):
+            plot_confidence_ellipse_on_ax(ax, m[t], x_cov[trial, t], color=c, alpha=0.2)
+
+        # Input arrows
+        if inputs is not None:
+            u = inputs[trial, :, :2, 0]  # (T, 2)
+            for t in range(T):
+                if np.linalg.norm(u[t]) > 1e-6:
+                    ax.annotate(
+                        '', xy=m[t] + input_scale * u[t], xytext=m[t],
+                        arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                        zorder=5,
+                    )
+
+    ax.set_aspect('equal')
+    ax.set_xlabel('$x_1$')
+    ax.set_ylabel('$x_2$')
+    return ax
+
+
+def plot_confidence_ellipse_on_ax(ax, mean, cov, color='k', alpha=0.3):
+    """Draw a 1-std confidence ellipse on a given axes."""
+    eigenvals, eigenvecs = np.linalg.eig(cov)
+    if np.any(eigenvals <= 0):
+        return
+    angle = np.degrees(np.arctan2(eigenvecs[1, 0], eigenvecs[0, 0]))
+    width, height = 2 * np.sqrt(eigenvals)
+    from matplotlib.patches import Ellipse
+    ell = Ellipse(xy=mean, width=width, height=height, angle=angle,
+                  edgecolor=color, facecolor=color, alpha=alpha, lw=0.5)
+    ax.add_patch(ell)
+
+
 def _diverging_norm(data, vmin_override=None):
     vmin = vmin_override if vmin_override is not None else np.min(data)
     vmax = np.max(data)
