@@ -12,6 +12,9 @@ dependencies = [
     "scikit-learn",
     "scikit-image",
     "mosek>=11.1.10",
+    "dynamax>=1.0.1",
+    "jax<0.6",
+    "jaxlib<0.6",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +22,19 @@ dev = [
     "jupyter",
     "ipykernel",
     "pytest",
+]
+
+[tool.uv.sources]
+ssm = { path = "vendor/Cell_type_dynamical_system/ssm", editable = true }
+adithis-utils = { path = "vendor/Cell_type_dynamical_system", editable = true }
+
+[dependency-groups]
+ref = [
+    "ssm",
+    "adithis-utils",
+    "autograd",
+    "numba",
+    "cython",
 ]
 
 [build-system]
