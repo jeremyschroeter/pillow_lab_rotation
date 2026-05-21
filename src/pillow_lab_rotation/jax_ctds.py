@@ -18,6 +18,9 @@ class CTDSJax(LinearDynamicalSystemJAX):
             Ne: int,
             Ni: int,
             udim: int = 0,
+            fit_mu0: bool = True,
+            fit_b: bool = False,
+            fit_d_bias: bool = False,
             key: Array | None = None
     ):
         self.De = De
@@ -29,7 +32,16 @@ class CTDSJax(LinearDynamicalSystemJAX):
         self.N = Ne + Ni
 
         # Initialize the parent LDS with inputs to latents only (no feedthrough)
-        super().__init__(xdim=self.D_lat, ydim=self.N, udim=udim, feedthrough=False, key=key)
+        super().__init__(
+            xdim=self.D_lat,
+            ydim=self.N,
+            udim=udim,
+            feedthrough=False,
+            fit_mu0=fit_mu0,
+            fit_b=fit_b,
+            fit_d_bias=fit_d_bias,
+            key=key,
+        )
         self.init_constraints()
 
     def init_constraints(self):
@@ -81,6 +93,8 @@ class CTDSJax(LinearDynamicalSystemJAX):
         self.Q = jnp.eye(self.D_lat)
         self.B = random.normal(keys[1], (self.D_lat, self.udim)) if self.udim > 0 else jnp.zeros((self.D_lat, self.udim))
         self.D = jnp.zeros((self.N, self.udim))  # feedthrough matrix; CTDS uses feedthrough=False so always zero
+        self.b = jnp.zeros((self.D_lat, 1))
+        self.d_bias = jnp.zeros((self.N, 1))
 
         if observations is not None:
             init = EIRNNInit(self.Ne, self.Ni, self.De, self.Di)
@@ -119,10 +133,12 @@ class CTDSJax(LinearDynamicalSystemJAX):
         else:
             self.update_A()
             self.update_C()
+        self.update_b()
+        self.update_d_bias()
         self.update_mu_and_Q0()
         self.update_Q()
         self.update_R()
-    
+
     def update_A(self):
         '''
         Constrained upate for A using QP
@@ -134,13 +150,20 @@ class CTDSJax(LinearDynamicalSystemJAX):
         Q_np = np.asarray(self.Q)
         M1Tm1_np = np.asarray(self.M1Tm1)
         M_delta_np = np.asarray(self.M_delta)
+        b_np = np.asarray(self.b)
+        m_sum_np = np.asarray(self.m_sum)
+        m_sum_T_np = np.asarray(self.m_sum_T)
 
         Q_inv = np.linalg.inv(Q_np)
         Q_tilde = Q_inv / np.max(np.abs(Q_inv))
         L = np.linalg.cholesky(Q_tilde)
 
+        # Effective cross-moment with dynamics bias: target is x_t - b.
+        m_sum_1Tm1 = m_sum_np - m_sum_T_np
+        M_delta_eff = M_delta_np - m_sum_1Tm1 @ b_np.T
+
         K = np.kron(np.eye(self.D_lat), L) @ np.kron(M1Tm1_np, np.eye(self.D_lat)) @ np.kron(np.eye(self.D_lat), L.T)
-        q = vec(Q_tilde.T @ M_delta_np.T)
+        q = vec(Q_tilde.T @ M_delta_eff.T)
 
         A = cp.Variable(self.D_lat * self.D_lat)
         objective = cp.Maximize(q.T @ A - 0.5 * cp.quad_form(A, cp.psd_wrap(K)))
@@ -150,7 +173,7 @@ class CTDSJax(LinearDynamicalSystemJAX):
         ]
         cp.Problem(objective, constraints).solve(solver=cp.MOSEK, verbose=False)
         self.A = jnp.asarray(A.value.reshape((self.D_lat, self.D_lat), order='F'))
-    
+
     def update_A_B(self):
         """Constrained joint update for A and B.
 
@@ -166,13 +189,24 @@ class CTDSJax(LinearDynamicalSystemJAX):
         U_hat_2T_np = np.asarray(self.U_hat_2T)
         U_delta_np = np.asarray(self.U_delta)
         U2T_np = np.asarray(self.U2T)
+        b_np = np.asarray(self.b)
+        m_sum_np = np.asarray(self.m_sum)
+        m_sum_T_np = np.asarray(self.m_sum_T)
+        u_sum_np = np.asarray(self.u_sum)
+        u_sum_1_np = np.asarray(self.u_sum_1)
 
         Q_inv = np.linalg.inv(Q_np)
         Q_tilde = Q_inv / np.max(np.abs(Q_inv))
         L = np.linalg.cholesky(Q_tilde)
 
+        # Effective cross-moments with dynamics bias: target is x_t - b.
+        m_sum_1Tm1 = m_sum_np - m_sum_T_np
+        u_sum_2T = u_sum_np - u_sum_1_np
+        M_delta_eff = M_delta_np - m_sum_1Tm1 @ b_np.T
+        U_hat_2T_eff = U_hat_2T_np - u_sum_2T @ b_np.T
+
         # See equation 87 in Adithis notes
-        M_delta_tilde = np.vstack([M_delta_np, U_hat_2T_np])
+        M_delta_tilde = np.vstack([M_delta_eff, U_hat_2T_eff])
         M_tilde_1Tm1 = np.block(
             [[M1Tm1_np, U_delta_np.T],
              [U_delta_np, U2T_np]]
@@ -207,18 +241,20 @@ class CTDSJax(LinearDynamicalSystemJAX):
         """
         M1T_np = np.asarray(self.M1T)
         Y_hat_np = np.asarray(self.Y_hat)
-
+        m_sum_np = np.asarray(self.m_sum)
+        d_bias_np = np.asarray(self.d_bias)
 
         rows = []
         for n in range(self.N):
+            d_n = d_bias_np[n, 0]
             if n < self.Ne:
                 c_n = cp.Variable(self.De)
                 P = M1T_np[:self.De, :self.De]
-                q = Y_hat_np[:self.De, n]
+                q = Y_hat_np[:self.De, n] - m_sum_np[:self.De, 0] * d_n
             else:
                 c_n = cp.Variable(self.Di)
                 P = M1T_np[self.De:, self.De:]
-                q = Y_hat_np[self.De:, n]
+                q = Y_hat_np[self.De:, n] - m_sum_np[self.De:, 0] * d_n
             objective = cp.Minimize(0.5 * cp.quad_form(c_n, cp.psd_wrap(P)) - q.T @ c_n)
             prob = cp.Problem(objective, [c_n >= 0])
             prob.solve(solver=cp.MOSEK, verbose=False)
@@ -231,8 +267,8 @@ class CTDSJax(LinearDynamicalSystemJAX):
     def update_R(self):
         """Update R with diagonal constraint.
 
-        Same formula as the LDS update_R, but then set off-diagonal to zero:
-            R = diag(diag(R))
+        Delegate to LDS update_R (which handles the d_bias contribution via the
+        full residual-variance formula), then zero the off-diagonal.
         """
         super().update_R()
         self.R = jnp.diag(jnp.diag(self.R))

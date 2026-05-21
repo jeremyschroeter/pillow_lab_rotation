@@ -18,6 +18,8 @@ def _run_filter(
         R: Array,
         mu0: Array,
         Q0: Array,
+        b: Array,
+        d_bias: Array,
         observations: Array,
         inputs: Array,
         n_trials: int,
@@ -38,8 +40,8 @@ def _run_filter(
         # Predict step for the next timepoint
         P_pred_next = A @ P_filt @ A.T + Q
         return P_pred_next, (P_pred, P_obs_inv, log_det, K, P_filt)
-    
-    
+
+
     # Carry: previous filtered state x_{t-1|t-1}, running LL, timestep counter.
     # Init: x_prev set to mu0 (its value is ignored at t=0 by the where below).
     def _mean_step(carry: tuple[Array], inputs: tuple[Array]):
@@ -47,15 +49,15 @@ def _run_filter(
         yt, ut, K_t, P_obs_inv_t, log_det_t = inputs
 
         # Prediction for the CURRENT timestep, using the current input.
-        # At t=0: xp = mu0 + B @ u_0; at t>=1: xp = A @ x_{t-1|t-1} + B @ u_t.
+        # At t=0: xp = mu0 + B @ u_0; at t>=1: xp = A @ x_{t-1|t-1} + B @ u_t + b.
         xp = jnp.where(
             t == 0,
             mu0 + B @ ut,
-            A @ x_prev + B @ ut,
+            A @ x_prev + B @ ut + b,
         )
 
         # Update step
-        innov = yt - C @ xp - D @ ut
+        innov = yt - C @ xp - D @ ut - d_bias
         xt = xp + K_t @ innov
 
         # LL accumulation
@@ -146,25 +148,26 @@ def _run_smoother(
 
     return m, sigma, sigma_x
 
-@partial(jax.jit, static_argnames=('xdim',))
+@partial(jax.jit, static_argnames=('xdim', 'ydim'))
 def _get_posterior_stats(
         mean: Array,
         sigma: Array,
         sigma_x: Array,
         observations: Array,
-        xdim: int
+        xdim: int,
+        ydim: int
 ) -> tuple[Array]:
-    
+
     def _second_moment(m_slice: Array, sigma_slice: Array):
         flat = m_slice.reshape(-1, xdim)
         return flat.T @ flat + sigma_slice.reshape(-1, xdim, xdim).sum(0)
-    
+
     def _cross_moment(a: Array, b: Array):
         return a.reshape(-1, a.shape[-1]).T @ b.reshape(-1, b.shape[-1])
-    
+
     m = mean[..., 0]
     y = observations[..., 0]
-    
+
     M11 = _second_moment(m[:, :1], sigma[:, :1])
     M2T = _second_moment(m[:, 1:], sigma[:, 1:])
     M1Tm1 = _second_moment(m[:, :-1], sigma[:, :-1])
@@ -175,17 +178,25 @@ def _get_posterior_stats(
     Y = _cross_moment(y, y)
     Y_hat = _cross_moment(m, y)
 
-    return M11, M2T, M1Tm1, M1T, M_delta, Y, Y_hat
+    # First-order sums for affine-bias updates.
+    m_sum = m.reshape(-1, xdim).sum(0).reshape(xdim, 1)
+    m_sum_1 = m[:, 0].sum(0).reshape(xdim, 1)
+    m_sum_T = m[:, -1].sum(0).reshape(xdim, 1)
+    y_sum = y.reshape(-1, ydim).sum(0).reshape(ydim, 1)
+
+    return M11, M2T, M1Tm1, M1T, M_delta, Y, Y_hat, m_sum, m_sum_1, m_sum_T, y_sum
 
 
-@partial(jax.jit, static_argnames=('xdim',))
+@partial(jax.jit, static_argnames=('xdim', 'ydim', 'udim'))
 def _get_posterior_stats_w_inputs(
         mean: Array,
         sigma: Array,
         sigma_x: Array,
         observations: Array,
         inputs: Array,
-        xdim: int
+        xdim: int,
+        ydim: int,
+        udim: int
 ) -> tuple[Array]:
     m = mean[..., 0]
     y = observations[..., 0]
@@ -194,7 +205,7 @@ def _get_posterior_stats_w_inputs(
     def _second_moment(m_slice: jax.Array, sigma_slice: jax.Array):
         flat = m_slice.reshape(-1, xdim)
         return flat.T @ flat + sigma_slice.reshape(-1, xdim, xdim).sum(0)
-    
+
     def _cross_moment(a: jax.Array, b: jax.Array):
         return a.reshape(-1, a.shape[-1]).T @ b.reshape(-1, b.shape[-1])
 
@@ -218,7 +229,17 @@ def _get_posterior_stats_w_inputs(
     U11 = _cross_moment(u[:, :1], u[:, :1])
     U_hat_11 = _cross_moment(u[:, :1], m[:, :1])
 
-    return M11, M2T, M1Tm1, M1T, M_delta, Y, Y_hat, U1T, U2T, U_hat_2T, Uy, U_delta, U_hat_1T, U11, U_hat_11
+    # First-order sums for affine-bias updates.
+    m_sum = m.reshape(-1, xdim).sum(0).reshape(xdim, 1)
+    m_sum_1 = m[:, 0].sum(0).reshape(xdim, 1)
+    m_sum_T = m[:, -1].sum(0).reshape(xdim, 1)
+    y_sum = y.reshape(-1, ydim).sum(0).reshape(ydim, 1)
+    u_sum = u.reshape(-1, udim).sum(0).reshape(udim, 1)
+    u_sum_1 = u[:, 0].sum(0).reshape(udim, 1)
+
+    return (M11, M2T, M1Tm1, M1T, M_delta, Y, Y_hat,
+            U1T, U2T, U_hat_2T, Uy, U_delta, U_hat_1T, U11, U_hat_11,
+            m_sum, m_sum_1, m_sum_T, y_sum, u_sum, u_sum_1)
 
 # ------------------------------------------------------------------
 # M-step
@@ -226,12 +247,17 @@ def _get_posterior_stats_w_inputs(
 @jax.jit
 def _update_A(
         M_delta: Array,
-        M1Tm1: Array
+        M1Tm1: Array,
+        b: Array,
+        m_sum: Array,
+        m_sum_T: Array,
 ) -> Array:
     '''
-    Update dynamics matrix given posterior statistics
+    Update dynamics matrix given posterior statistics. Effective target is x_t - b.
     '''
-    return M_delta.T @ inv(M1Tm1)
+    m_sum_1Tm1 = m_sum - m_sum_T
+    M_delta_eff = M_delta - m_sum_1Tm1 @ b.T
+    return M_delta_eff.T @ inv(M1Tm1)
 
 
 @partial(jax.jit, static_argnames=('xdim',))
@@ -241,12 +267,21 @@ def _update_A_B(
         U_hat_2T: Array,
         U_delta: Array,
         U2T: Array,
+        b: Array,
+        m_sum: Array,
+        m_sum_T: Array,
+        u_sum: Array,
+        u_sum_1: Array,
         xdim: int
 ) -> tuple[Array]:
     '''
-    Update dynamics and inputs matrix given posterior statistics
+    Update dynamics and inputs matrix given posterior statistics. Effective target is x_t - b.
     '''
-    first_matrix = jnp.block([M_delta.T, U_hat_2T.T])
+    m_sum_1Tm1 = m_sum - m_sum_T
+    u_sum_2T = u_sum - u_sum_1
+    M_delta_eff = M_delta - m_sum_1Tm1 @ b.T
+    U_hat_2T_eff = U_hat_2T - u_sum_2T @ b.T
+    first_matrix = jnp.block([M_delta_eff.T, U_hat_2T_eff.T])
     second_matrix = inv(jnp.block(
         [[M1Tm1, U_delta.T],
          [U_delta, U2T]]
@@ -258,14 +293,49 @@ def _update_A_B(
 
 
 @jax.jit
+def _update_b(
+        A: Array,
+        m_sum: Array,
+        m_sum_1: Array,
+        m_sum_T: Array,
+        n_trials: int,
+        T: int,
+) -> Array:
+    m_sum_2T = m_sum - m_sum_1
+    m_sum_1Tm1 = m_sum - m_sum_T
+    return (m_sum_2T - A @ m_sum_1Tm1) / ((T - 1) * n_trials)
+
+
+@jax.jit
+def _update_b_with_inputs(
+        A: Array,
+        B: Array,
+        m_sum: Array,
+        m_sum_1: Array,
+        m_sum_T: Array,
+        u_sum: Array,
+        u_sum_1: Array,
+        n_trials: int,
+        T: int,
+) -> Array:
+    m_sum_2T = m_sum - m_sum_1
+    m_sum_1Tm1 = m_sum - m_sum_T
+    u_sum_2T = u_sum - u_sum_1
+    return (m_sum_2T - A @ m_sum_1Tm1 - B @ u_sum_2T) / ((T - 1) * n_trials)
+
+
+@jax.jit
 def _update_C(
         Y_hat: Array,
-        M1T: Array
+        M1T: Array,
+        d_bias: Array,
+        m_sum: Array,
 ) -> Array:
     '''
-    Update emissions matrix given posterior statistics
+    Update emissions matrix given posterior statistics. Effective target is y_t - d_bias.
     '''
-    return Y_hat.T @ inv(M1T)
+    Y_hat_eff = Y_hat - m_sum @ d_bias.T
+    return Y_hat_eff.T @ inv(M1T)
 
 
 @partial(jax.jit, static_argnames=('xdim',))
@@ -275,12 +345,17 @@ def _update_C_D(
         M1T: Array,
         U_hat_1T: Array,
         U1T: Array,
+        d_bias: Array,
+        m_sum: Array,
+        u_sum: Array,
         xdim: int
 ) -> tuple[Array]:
     '''
-    Update emissions and feedthrough matrices given posterior statistics
+    Update emissions and feedthrough matrices given posterior statistics. Effective target is y_t - d_bias.
     '''
-    first_matrix = jnp.block([Y_hat.T, Uy.T])
+    Y_hat_eff = Y_hat - m_sum @ d_bias.T
+    Uy_eff = Uy - u_sum @ d_bias.T
+    first_matrix = jnp.block([Y_hat_eff.T, Uy_eff.T])
     second_matrix = inv(jnp.block(
         [[M1T, U_hat_1T.T],
          [U_hat_1T, U1T]]
@@ -293,39 +368,78 @@ def _update_C_D(
 
 
 @jax.jit
-def _update_mu0_and_Q0(
-        m: Array,
-        M11: Array,
-        n_trials: int
-) -> tuple[Array]:
-    '''
-    Update initial conditions and covariance given posterior statistics
-    '''
-    mu0 = m[:, 0, :, 0].mean(0, keepdims=True).T
-    Q0 = M11 / n_trials - mu0 @ mu0.T
-    return mu0, Q0
+def _update_d_bias(
+        C: Array,
+        m_sum: Array,
+        y_sum: Array,
+        n_trials: int,
+        T: int,
+) -> Array:
+    return (y_sum - C @ m_sum) / (T * n_trials)
 
 
 @jax.jit
-def _update_mu0_and_Q0_with_inputs(
+def _update_d_bias_with_feedthrough(
+        C: Array,
+        D: Array,
+        m_sum: Array,
+        u_sum: Array,
+        y_sum: Array,
+        n_trials: int,
+        T: int,
+) -> Array:
+    return (y_sum - C @ m_sum - D @ u_sum) / (T * n_trials)
+
+
+@jax.jit
+def _update_Q0(
+        m: Array,
+        mu0: Array,
+        M11: Array,
+        n_trials: int,
+) -> Array:
+    '''
+    General Q0 formula valid for any mu0 (whether optimal or held fixed).
+    Reduces to M11/N - mu0 @ mu0.T when mu0 equals the empirical mean.
+    '''
+    mbar_1 = m[:, 0, :, 0].mean(0, keepdims=True).T
+    Q0 = M11 / n_trials - mbar_1 @ mu0.T - mu0 @ mbar_1.T + mu0 @ mu0.T
+    return Q0
+
+
+@jax.jit
+def _update_Q0_with_inputs(
         m: Array,
         inputs: Array,
         B: Array,
+        mu0: Array,
         M11: Array,
         U11: Array,
         U_hat_11: Array,
-        n_trials: int
-) -> tuple[Array]:
+        n_trials: int,
+) -> Array:
     '''
-    Update initial conditions and covariance given posterior statistics
+    General Q0 formula valid for any mu0 (whether optimal or held fixed).
     '''
+    mbar_1 = m[:, 0, :, 0].mean(0, keepdims=True).T
+    ubar_1 = inputs[:, 0, :, 0].mean(0, keepdims=True).T
+    Q0 = M11 / n_trials - mbar_1 @ mu0.T - mu0 @ mbar_1.T + mu0 @ mu0.T
+    Q0 = Q0 - B @ U_hat_11 / n_trials - U_hat_11.T @ B.T / n_trials
+    Q0 = Q0 + mu0 @ ubar_1.T @ B.T + B @ ubar_1 @ mu0.T
+    Q0 = Q0 + B @ U11 @ B.T / n_trials
+    return Q0
+
+
+@jax.jit
+def _empirical_mu0(m: Array) -> Array:
+    return m[:, 0, :, 0].mean(0, keepdims=True).T
+
+
+@jax.jit
+def _empirical_mu0_with_inputs(m: Array, inputs: Array, B: Array) -> Array:
     mu0 = m[:, 0, :, 0].mean(0, keepdims=True).T
     u1_mean = inputs[:, 0, :, 0].mean(0, keepdims=True).T
-
-    mu0 = mu0 - B @ u1_mean
-    Q0 = M11 + B @ U11 @ B.T - B @ U_hat_11 - U_hat_11.T @ B.T
-    Q0 = Q0 / n_trials - mu0 @ mu0.T
-    return mu0, Q0
+    return mu0 - B @ u1_mean
 
 
 @jax.jit
@@ -334,13 +448,22 @@ def _update_Q(
         A: Array,
         M1Tm1: Array,
         M_delta: Array,
+        b: Array,
+        m_sum: Array,
+        m_sum_1: Array,
+        m_sum_T: Array,
         n_trials: int,
         T: int
 ) -> Array:
     '''
-    Update dynamics covariance given posterior statistics
+    Update dynamics covariance given posterior statistics (includes b contributions; zero when b=0).
     '''
     Q = M2T + A @ M1Tm1 @ A.T - A @ M_delta - M_delta.T @ A.T
+    m_sum_2T = m_sum - m_sum_1
+    m_sum_1Tm1 = m_sum - m_sum_T
+    Q = Q + ((T - 1) * n_trials * b @ b.T
+             - b @ m_sum_2T.T - m_sum_2T @ b.T
+             + A @ m_sum_1Tm1 @ b.T + b @ m_sum_1Tm1.T @ A.T)
     Q = Q / (n_trials * (T - 1))
     return Q
 
@@ -355,11 +478,17 @@ def _update_Q_with_inputs(
         U2T: Array,
         U_hat_2T: Array,
         U_delta: Array,
+        b: Array,
+        m_sum: Array,
+        m_sum_1: Array,
+        m_sum_T: Array,
+        u_sum: Array,
+        u_sum_1: Array,
         n_trials: int,
         T: int
 ) -> Array:
     '''
-    Update dynamics covariance given posterior statistics
+    Update dynamics covariance given posterior statistics (includes b contributions; zero when b=0).
     '''
     Q = M2T + A @ M1Tm1 @ A.T - A @ M_delta - M_delta.T @ A.T
     Q = Q + (B @ U2T @ B.T - \
@@ -367,6 +496,13 @@ def _update_Q_with_inputs(
              U_hat_2T.T @ B.T + \
              B @ U_delta @ A.T + \
              A @ U_delta.T @ B.T)
+    m_sum_2T = m_sum - m_sum_1
+    m_sum_1Tm1 = m_sum - m_sum_T
+    u_sum_2T = u_sum - u_sum_1
+    Q = Q + ((T - 1) * n_trials * b @ b.T
+             - b @ m_sum_2T.T - m_sum_2T @ b.T
+             + A @ m_sum_1Tm1 @ b.T + b @ m_sum_1Tm1.T @ A.T
+             + B @ u_sum_2T @ b.T + b @ u_sum_2T.T @ B.T)
     Q = Q / (n_trials * (T - 1))
     return Q
 
@@ -377,13 +513,19 @@ def _update_R(
         C: Array,
         M1T: Array,
         Y_hat: Array,
+        d_bias: Array,
+        m_sum: Array,
+        y_sum: Array,
         n_trials: int,
         T: int
 ) -> Array:
     '''
-    Update observations covariance given posterior statistics
+    Update observations covariance given posterior statistics (includes d_bias contributions; zero when d_bias=0).
     '''
     R = Y + C @ M1T @ C.T - C @ Y_hat - Y_hat.T @ C.T
+    R = R + (T * n_trials * d_bias @ d_bias.T
+             - d_bias @ y_sum.T - y_sum @ d_bias.T
+             + C @ m_sum @ d_bias.T + d_bias @ m_sum.T @ C.T)
     R = R / (T * n_trials)
     return R
 
@@ -398,11 +540,15 @@ def _update_R_with_inputs(
         U1T: Array,
         Uy: Array,
         U_hat_1T: Array,
+        d_bias: Array,
+        m_sum: Array,
+        u_sum: Array,
+        y_sum: Array,
         n_trials: int,
         T: int
 ) -> Array:
     '''
-    Update observation covariance given posterior statistics
+    Update observation covariance given posterior statistics (includes d_bias contributions; zero when d_bias=0).
     '''
     R = Y + C @ M1T @ C.T - C @ Y_hat - Y_hat.T @ C.T
     R = R + (D @ U1T @ D.T - \
@@ -410,6 +556,10 @@ def _update_R_with_inputs(
              Uy.T @ D.T + \
              D @ U_hat_1T @ C.T + \
              C @ U_hat_1T.T @ D.T)
+    R = R + (T * n_trials * d_bias @ d_bias.T
+             - d_bias @ y_sum.T - y_sum @ d_bias.T
+             + C @ m_sum @ d_bias.T + d_bias @ m_sum.T @ C.T
+             + D @ u_sum @ d_bias.T + d_bias @ u_sum.T @ D.T)
     R = R / (T * n_trials)
     return R
 
@@ -421,12 +571,18 @@ class LinearDynamicalSystemJAX:
             ydim: int,
             udim: int | None = None,
             feedthrough: bool = True,
+            fit_mu0: bool = True,
+            fit_b: bool = False,
+            fit_d_bias: bool = False,
             key: jax.Array | None = None
     ):
         self.xdim = xdim
         self.ydim = ydim
         self.udim = udim if udim is not None else 0
         self.feedthrough = feedthrough
+        self.fit_mu0 = fit_mu0
+        self.fit_b = fit_b
+        self.fit_d_bias = fit_d_bias
         self.key = key if key is not None else random.PRNGKey(0)
         self.init_params()
 
@@ -454,6 +610,10 @@ class LinearDynamicalSystemJAX:
             self.D = jax.random.normal(keys[3], (self.ydim, self.udim))
         else:
             self.D = jnp.zeros((self.ydim, self.udim))
+
+        # Affine bias params; zero when not fit so all formulas are no-ops in that case
+        self.b = jnp.zeros((self.xdim, 1))
+        self.d_bias = jnp.zeros((self.ydim, 1))
 
     # ------------------------------------------------------------------
     # Fit
@@ -505,7 +665,7 @@ class LinearDynamicalSystemJAX:
         (self.P_predicted, self.P_filtered,
          self.x_predicted, self.x_filtered, self.LL) = _run_filter(
             self.A, self.B, self.C, self.D, self.Q, self.R,
-            self.mu0, self.Q0, self.observations, self.inputs,
+            self.mu0, self.Q0, self.b, self.d_bias, self.observations, self.inputs,
             self.n_trials, self.T, self.xdim, self.ydim,
         )
 
@@ -520,13 +680,17 @@ class LinearDynamicalSystemJAX:
         if self.udim > 0:
             (self.M11, self.M2T, self.M1Tm1, self.M1T, self.M_delta, self.Y, self.Y_hat,
              self.U1T, self.U2T, self.U_hat_2T, self.Uy,
-             self.U_delta, self.U_hat_1T, self.U11, self.U_hat_11) = _get_posterior_stats_w_inputs(
-                self.m, self.sigma, self.sigma_x, self.observations, self.inputs, self.xdim,
+             self.U_delta, self.U_hat_1T, self.U11, self.U_hat_11,
+             self.m_sum, self.m_sum_1, self.m_sum_T, self.y_sum,
+             self.u_sum, self.u_sum_1) = _get_posterior_stats_w_inputs(
+                self.m, self.sigma, self.sigma_x, self.observations, self.inputs,
+                self.xdim, self.ydim, self.udim,
             )
         else:
             (self.M11, self.M2T, self.M1Tm1, self.M1T,
-             self.M_delta, self.Y, self.Y_hat) = _get_posterior_stats(
-                self.m, self.sigma, self.sigma_x, self.observations, self.xdim,
+             self.M_delta, self.Y, self.Y_hat,
+             self.m_sum, self.m_sum_1, self.m_sum_T, self.y_sum) = _get_posterior_stats(
+                self.m, self.sigma, self.sigma_x, self.observations, self.xdim, self.ydim,
             )
 
     # ------------------------------------------------------------------
@@ -542,45 +706,81 @@ class LinearDynamicalSystemJAX:
         else:
             self.update_A()
             self.update_C()
+        self.update_b()
+        self.update_d_bias()
         self.update_mu_and_Q0()
         self.update_Q()
         self.update_R()
 
     def update_A(self):
-        self.A = _update_A(self.M_delta, self.M1Tm1)
+        self.A = _update_A(self.M_delta, self.M1Tm1, self.b, self.m_sum, self.m_sum_T)
 
     def update_A_B(self):
         self.A, self.B = _update_A_B(
-            self.M_delta, self.M1Tm1, self.U_hat_2T, self.U_delta, self.U2T, self.xdim,
+            self.M_delta, self.M1Tm1, self.U_hat_2T, self.U_delta, self.U2T,
+            self.b, self.m_sum, self.m_sum_T, self.u_sum, self.u_sum_1, self.xdim,
         )
 
+    def update_b(self):
+        if not self.fit_b:
+            return
+        if self.udim > 0:
+            self.b = _update_b_with_inputs(
+                self.A, self.B, self.m_sum, self.m_sum_1, self.m_sum_T,
+                self.u_sum, self.u_sum_1, self.n_trials, self.T,
+            )
+        else:
+            self.b = _update_b(self.A, self.m_sum, self.m_sum_1, self.m_sum_T, self.n_trials, self.T)
+
     def update_C(self):
-        self.C = _update_C(self.Y_hat, self.M1T)
+        self.C = _update_C(self.Y_hat, self.M1T, self.d_bias, self.m_sum)
 
     def update_C_D(self):
         self.C, self.D = _update_C_D(
-            self.Y_hat, self.Uy, self.M1T, self.U_hat_1T, self.U1T, self.xdim,
+            self.Y_hat, self.Uy, self.M1T, self.U_hat_1T, self.U1T,
+            self.d_bias, self.m_sum, self.u_sum, self.xdim,
         )
 
-    def update_mu_and_Q0(self):
-        if self.udim > 0:
-            self.mu0, self.Q0 = _update_mu0_and_Q0_with_inputs(
-                self.m, self.inputs, self.B,
-                self.M11, self.U11, self.U_hat_11, self.n_trials,
+    def update_d_bias(self):
+        if not self.fit_d_bias:
+            return
+        if self.udim > 0 and self.feedthrough:
+            self.d_bias = _update_d_bias_with_feedthrough(
+                self.C, self.D, self.m_sum, self.u_sum, self.y_sum, self.n_trials, self.T,
             )
         else:
-            self.mu0, self.Q0 = _update_mu0_and_Q0(self.m, self.M11, self.n_trials)
+            self.d_bias = _update_d_bias(self.C, self.m_sum, self.y_sum, self.n_trials, self.T)
+
+    def update_mu_and_Q0(self):
+        # Optimal mu0 (with inputs: mbar_1 - B ubar_1); skipped when fit_mu0=False.
+        if self.fit_mu0:
+            if self.udim > 0:
+                self.mu0 = _empirical_mu0_with_inputs(self.m, self.inputs, self.B)
+            else:
+                self.mu0 = _empirical_mu0(self.m)
+        # General Q0 formula valid for any mu0.
+        if self.udim > 0:
+            self.Q0 = _update_Q0_with_inputs(
+                self.m, self.inputs, self.B, self.mu0, self.M11,
+                self.U11, self.U_hat_11, self.n_trials,
+            )
+        else:
+            self.Q0 = _update_Q0(self.m, self.mu0, self.M11, self.n_trials)
 
     def update_Q(self):
         if self.udim > 0:
             self.Q = _update_Q_with_inputs(
                 self.M2T, self.A, self.M1Tm1, self.M_delta,
                 self.B, self.U2T, self.U_hat_2T, self.U_delta,
+                self.b, self.m_sum, self.m_sum_1, self.m_sum_T,
+                self.u_sum, self.u_sum_1,
                 self.n_trials, self.T,
             )
         else:
             self.Q = _update_Q(
-                self.M2T, self.A, self.M1Tm1, self.M_delta, self.n_trials, self.T,
+                self.M2T, self.A, self.M1Tm1, self.M_delta,
+                self.b, self.m_sum, self.m_sum_1, self.m_sum_T,
+                self.n_trials, self.T,
             )
 
     def update_R(self):
@@ -588,11 +788,14 @@ class LinearDynamicalSystemJAX:
             self.R = _update_R_with_inputs(
                 self.Y, self.C, self.M1T, self.Y_hat,
                 self.D, self.U1T, self.Uy, self.U_hat_1T,
+                self.d_bias, self.m_sum, self.u_sum, self.y_sum,
                 self.n_trials, self.T,
             )
         else:
             self.R = _update_R(
-                self.Y, self.C, self.M1T, self.Y_hat, self.n_trials, self.T,
+                self.Y, self.C, self.M1T, self.Y_hat,
+                self.d_bias, self.m_sum, self.y_sum,
+                self.n_trials, self.T,
             )
 
     # ------------------------------------------------------------------
@@ -608,7 +811,7 @@ class LinearDynamicalSystemJAX:
         U = inputs if inputs is not None else jnp.zeros((trials, timesteps, self.udim, 1))
         return _run_filter(
             self.A, self.B, self.C, self.D, self.Q, self.R,
-            self.mu0, self.Q0, Y, U,
+            self.mu0, self.Q0, self.b, self.d_bias, Y, U,
             trials, timesteps, self.xdim, self.ydim,
         )
 
@@ -639,11 +842,11 @@ class LinearDynamicalSystemJAX:
             mean_x = jnp.where(
                 is_first,
                 self.mu0 + self.B @ ut,
-                self.A @ x_prev + self.B @ ut,
+                self.A @ x_prev + self.B @ ut + self.b,
             )
 
             x_t = mean_x + chol_for_x @ random.normal(k_proc, (n_trials, self.xdim, 1))
-            y_t = self.C @ x_t + self.D @ ut + chol_R @ random.normal(k_obs, (n_trials, self.ydim, 1))
+            y_t = self.C @ x_t + self.D @ ut + self.d_bias + chol_R @ random.normal(k_obs, (n_trials, self.ydim, 1))
             return (x_t, t + 1), (x_t, y_t)
 
         _, (x, y) = jax.lax.scan(

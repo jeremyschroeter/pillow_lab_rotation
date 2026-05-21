@@ -14,7 +14,10 @@ class CTDS(LinearDynamicalSystem):
             Di: int,
             Ne: int,
             Ni: int,
-            udim: int = 0
+            udim: int = 0,
+            fit_mu0: bool = True,
+            fit_b: bool = False,
+            fit_d_bias: bool = False
     ):
         self.De = De
         self.Di = Di
@@ -24,7 +27,15 @@ class CTDS(LinearDynamicalSystem):
         self.D_lat = De + Di
         self.N = Ne + Ni
         # Initialize the parent LDS with inputs to latents only (no feedthrough)
-        super().__init__(xdim=self.D_lat, ydim=self.N, udim=udim, feedthrough=False)
+        super().__init__(
+            xdim=self.D_lat,
+            ydim=self.N,
+            udim=udim,
+            feedthrough=False,
+            fit_mu0=fit_mu0,
+            fit_b=fit_b,
+            fit_d_bias=fit_d_bias,
+        )
         self.init_constraints()
 
     def init_constraints(self):
@@ -95,6 +106,8 @@ class CTDS(LinearDynamicalSystem):
         self.Q = np.eye(self.D_lat)
         self.B = np.random.randn(self.D_lat, self.udim) if self.udim > 0 else np.zeros((self.D_lat, self.udim))
         self.D = np.zeros((self.N, self.udim))  # feedthrough matrix; CTDS uses feedthrough=False so always zero
+        self.b = np.zeros((self.D_lat, 1))
+        self.d_bias = np.zeros((self.N, 1))
 
         if observations is not None:
             init = EIRNNInit(self.Ne, self.Ni, self.De, self.Di)
@@ -146,6 +159,8 @@ class CTDS(LinearDynamicalSystem):
         else:
             self.update_A()
             self.update_C()
+        self.update_b()
+        self.update_d_bias()
         self.update_mu_and_Q0()
         self.update_Q()
         self.update_R()
@@ -166,9 +181,13 @@ class CTDS(LinearDynamicalSystem):
         Q_tilde = Q_inv / np.max(np.abs(Q_inv))
         L = np.linalg.cholesky(Q_tilde)
 
+        # Effective cross-moment with dynamics bias: target is x_t - b.
+        m_sum_1Tm1 = self.m_sum - self.m_sum_T
+        M_delta_eff = self.M_delta - m_sum_1Tm1 @ self.b.T
+
         # Equation 80 from Adithis doc
         K = np.kron(np.eye(self.D_lat), L) @ np.kron(self.M1Tm1, np.eye(self.D_lat)) @ np.kron(np.eye(self.D_lat), L.T)
-        q = vec(Q_tilde.T @ self.M_delta.T)
+        q = vec(Q_tilde.T @ M_delta_eff.T)
 
         objective = cp.Maximize(q.T @ A - 0.5 * cp.quad_form(A, cp.psd_wrap(K)))
         constraints = [
@@ -193,8 +212,14 @@ class CTDS(LinearDynamicalSystem):
         Q_tilde = Q_inv / np.max(np.abs(Q_inv))
         L = np.linalg.cholesky(Q_tilde)
 
+        # Effective cross-moments with dynamics bias: target is x_t - b.
+        m_sum_1Tm1 = self.m_sum - self.m_sum_T
+        u_sum_2T = self.u_sum - self.u_sum_1
+        M_delta_eff = self.M_delta - m_sum_1Tm1 @ self.b.T
+        U_hat_2T_eff = self.U_hat_2T - u_sum_2T @ self.b.T
+
         # See equation 87 in Adithis notes
-        M_delta_tilde = np.vstack([self.M_delta, self.U_hat_2T])
+        M_delta_tilde = np.vstack([M_delta_eff, U_hat_2T_eff])
         M_tilde_1Tm1 = np.block(
             [[self.M1Tm1, self.U_delta.T],
              [self.U_delta, self.U2T]]
@@ -225,35 +250,74 @@ class CTDS(LinearDynamicalSystem):
           - If n < Ne: c_n has De free (non-negative) entries, Di zeros
           - If n >= Ne: c_n has De zeros, Di free (non-negative) entries
 
-        Minimize:  0.5 c_n^T P c_n - q^T c_n   s.t.  c_n >= 0
-        where P and q are the relevant sub-blocks of M1T and Y_hat.
+        When fit_d_bias is True, c_n and d_n are updated *jointly* per row via an
+        augmented predictor [x_t; 1] — matches a single closed-form OLS step
+        instead of the block-coordinate (c then d) sweep. update_d_bias becomes
+        a no-op in that case.
         """
         rows = []
+        d_new = np.zeros((self.N, 1))
+        T_N = self.T * self.n_trials
         for n in range(self.N):
             if n < self.Ne:
-                c_n = cp.Variable(self.De)
-                P = self.M1T[:self.De, :self.De]
-                q = self.Y_hat[:self.De, n]
+                block = slice(None, self.De)
+                free_dim = self.De
             else:
-                c_n = cp.Variable(self.Di)
-                P = self.M1T[self.De:, self.De:]
-                q = self.Y_hat[self.De:, n]
-            objective = cp.Minimize(0.5 * cp.quad_form(c_n, cp.psd_wrap(P)) - q.T @ c_n)
-            prob = cp.Problem(objective, [c_n >= 0])
-            prob.solve(solver=cp.MOSEK, verbose=False)
+                block = slice(self.De, None)
+                free_dim = self.Di
+
+            P_block = self.M1T[block, block]
+            q_block = self.Y_hat[block, n]
+            m_sum_block = self.m_sum[block, 0]
+
+            if self.fit_d_bias:
+                # Joint per-row OLS over (c_n, d_n) with c_n >= 0, d_n free.
+                P = np.block([[P_block, m_sum_block[:, None]],
+                              [m_sum_block[None, :], np.array([[T_N]])]])
+                q = np.concatenate([q_block, [self.y_sum[n, 0]]])
+                z = cp.Variable(free_dim + 1)
+                objective = cp.Minimize(0.5 * cp.quad_form(z, cp.psd_wrap(P)) - q.T @ z)
+                prob = cp.Problem(objective, [z[:free_dim] >= 0])
+                prob.solve(solver=cp.MOSEK, verbose=False)
+                c_val = z.value[:free_dim]
+                d_new[n, 0] = z.value[free_dim]
+            else:
+                # d_n is held at its current value; subtract its contribution from q.
+                d_n = self.d_bias[n, 0]
+                q = q_block - m_sum_block * d_n
+                c_n = cp.Variable(free_dim)
+                objective = cp.Minimize(0.5 * cp.quad_form(c_n, cp.psd_wrap(P_block)) - q.T @ c_n)
+                prob = cp.Problem(objective, [c_n >= 0])
+                prob.solve(solver=cp.MOSEK, verbose=False)
+                c_val = c_n.value
+                d_new[n, 0] = self.d_bias[n, 0]
+
             if n < self.Ne:
-                rows.append(np.hstack([c_n.value, np.zeros(self.Di)]))
+                rows.append(np.hstack([c_val, np.zeros(self.Di)]))
             else:
-                rows.append(np.hstack([np.zeros(self.De), c_n.value]))
+                rows.append(np.hstack([np.zeros(self.De), c_val]))
         self.C = np.array(rows)
+        if self.fit_d_bias:
+            # d_bias was solved jointly with C above; the inherited update_d_bias
+            # would otherwise re-update it via the block-coordinate formula.
+            self.d_bias = d_new
+            self._d_bias_already_updated = True
+        else:
+            self._d_bias_already_updated = False
+
+    def update_d_bias(self):
+        # When fit_d_bias=True and we already solved (c_n, d_n) jointly in
+        # update_C, skip the block-coordinate update here so we keep the joint
+        # optimum.
+        if getattr(self, '_d_bias_already_updated', False):
+            return
+        super().update_d_bias()
 
     def update_R(self):
         """Update R with diagonal constraint.
 
-        Same formula as the LDS update_R, but then set off-diagonal to zero:
-            R = diag(diag(R))
+        Delegate to LDS update_R (which handles the d_bias contribution via the
+        full residual-variance formula), then zero the off-diagonal.
         """
-        normalizer = (1 / (self.T * self.n_trials))
-        unnormalized = (self.Y - self.C@self.Y_hat - self.Y_hat.T @ self.C.T + self.C @ self.M1T @ self.C.T)
-
-        self.R = np.diag(np.diag(normalizer * unnormalized))
+        super().update_R()
+        self.R = np.diag(np.diag(self.R))
