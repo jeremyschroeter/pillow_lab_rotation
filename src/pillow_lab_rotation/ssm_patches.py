@@ -42,6 +42,7 @@ def _fixed_solve_constrained_A(self, k, ExuxuTs_k, ExuyTs_k, Sigmas_k):
     kron_ExuxuTs = np.kron((ExuxuTs_k + self.J0_k).T, np.eye(D))
     W = cp.Variable((D, D * lags + M))
     constraints = self.within_region_constraints(W) + self.across_region_constraints(W)
+    print(W, ExuyTs_k + self.h0_k, Q_inv)
     objective = cp.Minimize(
         cp.quad_form((L.T @ W).flatten(order='F'), cp.psd_wrap(kron_ExuxuTs))
         - 2 * cp.sum(cp.diag(Q_inv @ W @ (ExuyTs_k + self.h0_k)))

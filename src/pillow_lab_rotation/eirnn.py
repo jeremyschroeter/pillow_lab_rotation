@@ -1,6 +1,6 @@
 import numpy as np
-import cvxpy as cp
 from scipy.linalg import block_diag
+from scipy.optimize import nnls
 from sklearn.decomposition import NMF
 
 
@@ -50,15 +50,19 @@ class EIRNNInit:
 
 
     def _solve_constrained_regression(self):
-        J = cp.Variable(shape=(self.N, self.N))
-        constraints = [
-            J[:, :self.Ne] >= 0,
-            J[:, self.Ne:] <= 0
-        ]
-        objective = cp.Minimize(cp.norm(self.Ytp1.T - J @ self.Yt.T, 'fro'))
-        prob = cp.Problem(objective, constraints)
-        prob.solve(solver=cp.MOSEK, verbose=False)
-        self.J_fit = J.value
+        print('solving regression', flush=True)
+        # Frobenius objective is row-separable and sign constraints are
+        # column-wise, so each row j_n of J is an independent NNLS problem.
+        # Reparameterize beta = [j_n[:Ne], -j_n[Ne:]] so all coefficients
+        # are non-negative; the design matrix flips sign on the I block.
+        X = np.hstack([self.Yt[:, :self.Ne], -self.Yt[:, self.Ne:]])
+
+        J = np.zeros((self.N, self.N))
+        for n in range(self.N):
+            beta, _ = nnls(X, self.Ytp1[:, n])
+            J[n, :self.Ne] = beta[:self.Ne]
+            J[n, self.Ne:] = -beta[self.Ne:]
+        self.J_fit = J
     
     def _nmf(self):
         Je = np.abs(self.J_fit[:self.Ne])
@@ -66,6 +70,7 @@ class EIRNNInit:
 
         best_error = np.inf
         for i in range(self.nmf_runs):
+            print(f'NMF run {i + 1} / {self.nmf_runs}', flush=True)
             e_model = NMF(n_components=self.De, init='random', random_state=self.start_seed + i)
             We = e_model.fit_transform(Je)
             He = e_model.components_

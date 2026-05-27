@@ -84,42 +84,104 @@ class CTDSJax(LinearDynamicalSystemJAX):
     def init_params(
             self,
             observations: Array | None = None,
-            start_seed: int = 0
+            *,
+            init: str = 'identity',
+            start_seed: int = 0,
     ):
-        keys = random.split(self.key, 4)
+        """Initialize parameters.
 
-        self.mu0 = random.normal(keys[0], (self.D_lat, 1))
+        init: 'identity' | 'random' | 'eirnn'
+          - 'identity': A=I, mu0=0; C is the same Dale-respecting block-diagonal
+            random matrix as the 'random' mode (off-diagonal blocks zero).
+          - 'random':   A and mu0 random (Dale signs on A); C as above.
+          - 'eirnn':    EIRNN/NMF init from observations (requires observations).
+        In every mode, biases are zero and noise covariances are identity.
+        """
+        if init == 'identity':
+            self._init_identity(start_seed)
+        elif init == 'random':
+            self._init_random(start_seed)
+        elif init == 'eirnn':
+            if observations is None:
+                raise ValueError("init='eirnn' requires observations")
+            self._init_eirnn(observations, start_seed)
+        else:
+            raise ValueError(
+                f"Unknown init={init!r}; expected 'identity', 'random', or 'eirnn'"
+            )
+
+    def _shared_defaults(self):
+        """Params common to every init: noise=I, zero feedthrough, zero biases."""
         self.Q0 = jnp.eye(self.D_lat)
         self.Q = jnp.eye(self.D_lat)
-        self.B = random.normal(keys[1], (self.D_lat, self.udim)) if self.udim > 0 else jnp.zeros((self.D_lat, self.udim))
-        self.D = jnp.zeros((self.N, self.udim))  # feedthrough matrix; CTDS uses feedthrough=False so always zero
+        self.R = jnp.eye(self.N)
+        self.B = jnp.zeros((self.D_lat, self.udim))
+        self.D = jnp.zeros((self.N, self.udim))
         self.b = jnp.zeros((self.D_lat, 1))
         self.d_bias = jnp.zeros((self.N, 1))
 
-        if observations is not None:
-            init = EIRNNInit(self.Ne, self.Ni, self.De, self.Di)
-            init.fit(np.asarray(observations), start_seed=start_seed)
-            self.A = jnp.asarray(init.A)
-            self.C = jnp.asarray(init.C)
-            self.R = jnp.asarray(init.R)
-            self.Q = jnp.asarray(init.Q)
-            self.mu0 = jnp.asarray(init.mu0)
-            self.Q0 = jnp.asarray(init.Q0)
+    def _random_C(self, key):
+        """Dale-respecting block-diagonal non-negative C."""
+        k_e, k_i = random.split(key)
+        e2e = random.uniform(k_e, (self.Ne, self.De))
+        i2i = random.uniform(k_i, (self.Ni, self.Di))
+        return jnp.block([
+            [e2e, jnp.zeros((self.Ne, self.Di))],
+            [jnp.zeros((self.Ni, self.De)), i2i],
+        ])
 
-        else:
-            self.A = jnp.zeros((self.D_lat, self.D_lat))
+    def _init_identity(self, start_seed: int):
+        self._shared_defaults()
+        key = random.fold_in(self.key, start_seed)
+        self.mu0 = jnp.zeros((self.D_lat, 1))
+        self.A = jnp.eye(self.D_lat)
+        self.C = self._random_C(key)
 
-            e2e_block = random.uniform(keys[2], shape=(self.Ne, self.De))
-            e2i_block = jnp.zeros((self.Ni, self.De))
-            i2i_block = random.uniform(keys[3], (self.Ni, self.Di))
-            i2e_block = jnp.zeros((self.Ne, self.Di))
+    def _init_random(self, start_seed: int):
+        self._shared_defaults()
+        keys = random.split(random.fold_in(self.key, start_seed), 5)
+        self.mu0 = random.normal(keys[0], (self.D_lat, 1))
+        # Dale-respecting A: E columns >=0, I columns <=0.
+        A_E = random.uniform(keys[1], (self.D_lat, self.De))
+        A_I = -random.uniform(keys[2], (self.D_lat, self.Di))
+        self.A = jnp.hstack([A_E, A_I])
+        self.C = self._random_C(keys[3])
+        if self.udim > 0:
+            self.B = random.normal(keys[4], (self.D_lat, self.udim))
 
-            self.C = jnp.block(
-                [[e2e_block, i2e_block],
-                [e2i_block, i2i_block]]
-            )
-            self.R = jnp.eye(self.N)
-    
+    def _init_eirnn(self, observations: Array, start_seed: int):
+        self._shared_defaults()
+        init = EIRNNInit(self.Ne, self.Ni, self.De, self.Di)
+        init.fit(np.asarray(observations), start_seed=start_seed)
+        self.A = jnp.asarray(init.A)
+        self.C = jnp.asarray(init.C)
+        self.R = jnp.asarray(init.R)
+        self.Q = jnp.asarray(init.Q)
+        self.mu0 = jnp.asarray(init.mu0)
+        self.Q0 = jnp.asarray(init.Q0)
+
+    def fit(
+            self,
+            observations: Array,
+            inputs: Array | None = None,
+            init: str | None = None,
+            start_seed: int = 0,
+            verbose: bool = False,
+            max_iter: int | None = None,
+            criterion: float = 1e-8,
+    ):
+        """EM fit; if `init` is given, (re-)initialize params first."""
+        if init is not None:
+            self.init_params(observations, init=init, start_seed=start_seed)
+        return super().fit(
+            observations,
+            inputs=inputs,
+            verbose=verbose,
+            max_iter=max_iter,
+            criterion=criterion,
+        )
+
+
     def m_step(self):
         """Override to call the constrained update methods.
 
